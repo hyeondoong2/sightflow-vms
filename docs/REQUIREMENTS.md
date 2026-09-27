@@ -22,7 +22,11 @@ SightFlow VMS is a video management system that will eventually:
 This is the destination, not a spec for what to build next. Only the current
 roadmap phase (`docs/ROADMAP.md`) defines what is actually in scope right now.
 
-## Phase 1 requirements (current phase)
+## Phase 1 requirements (next phase — implementation not yet started)
+
+The project is currently in Phase 0 (documentation/design stage; see
+`docs/ROADMAP.md`). The requirements below define what Phase 1 must do once
+its implementation begins.
 
 ### In scope
 

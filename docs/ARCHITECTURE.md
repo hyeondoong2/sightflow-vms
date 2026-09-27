@@ -1,10 +1,11 @@
 # Architecture
 
-This document describes the architecture of the **current phase only**
-(Phase 1: single RTSP stream → decode → display). See `docs/ROADMAP.md` for
-what changes in later phases, and `docs/REQUIREMENTS.md` for what Phase 1 must
-do. Do not extend this design for multi-channel, motion detection, SQLite, or
-MCP until their phase begins — see `docs/DECISIONS.md` for why.
+This document describes the architecture planned for **Phase 1** (single
+RTSP stream → decode → display) — the implementation phase, which has not
+started yet (the project is currently in Phase 0, documentation/design; see
+`docs/ROADMAP.md`). See `docs/REQUIREMENTS.md` for what Phase 1 must do. Do
+not extend this design for multi-channel, motion detection, SQLite, or MCP
+until their phase begins — see `docs/DECISIONS.md` for why.
 
 ## 1. Data flow
 
@@ -15,13 +16,20 @@ RTSP URL
 [Capture/Decode worker thread]
    RtspSource.open()                        (pre-allocated AVFormatContext, interrupt callback installed first)
    loop while !stopRequested:
-     av_read_frame()          → AVPacket        (owned by RtspSource, unref'd each iteration)
-     Decoder.sendPacket()     → (packet consumed)
-     Decoder.receiveFrame()   → AVFrame          (decoded YUV frame, owned by Decoder, scoped to this iteration)
-     FrameConverter.convert() → VideoFrame        (app-owned: pixel buffer + width/height/stride/format)
-     FrameQueue.push(frame)   → drop-oldest if at capacity (2)
+     av_read_frame()             → AVPacket   (owned by RtspSource)
+     if packet belongs to the selected video stream:
+       Decoder.sendPacket(packet)             (packet handed to decoder)
+       repeat Decoder.receiveFrame() until EAGAIN / EOF / error:
+         → AVFrame                (decoded YUV frame, owned by Decoder, scoped to this call)
+         FrameConverter.convert() → VideoFrame  (app-owned: pixel buffer + width/height/stride/format)
+         FrameQueue.push(frame)   → drop-oldest if at capacity (2)
+     else:
+       (packet belongs to another stream, e.g. audio — not sent to the decoder)
+     AVPacket unref'd/released                (every code path, every iteration)
    │
-   │  (thread boundary — FrameQueue holds the only data shared between threads)
+   │  (thread boundary — FrameQueue is the only channel used to transfer
+   │   video frame data between threads; see below for the separate
+   │   control/state mechanisms that also cross this boundary)
    ▼
 [Qt UI thread]
    QTimer (fixed interval) ticks
@@ -29,12 +37,22 @@ RTSP URL
      → VideoDisplayItem displays it, previous VideoFrame is destroyed
 ```
 
-Only two things ever cross the worker/UI thread boundary: `VideoFrame`s via
-`FrameQueue` (§4–5), and small state-change notifications (`Connecting` /
-`Connected` / `Error` / `Stopped`) via a normal Qt queued signal that carries
-no frame data. No FFmpeg type (`AVPacket`, `AVFrame`, `AVFormatContext`,
-`AVCodecContext`) ever crosses the thread boundary, and the worker never
-emits one Qt signal per decoded frame (§3, §5).
+`FrameQueue` (§4–5) is the only channel used to transfer **video frame data**
+across the worker/UI thread boundary — it is not the only thing shared
+between the two threads, just the only path frame pixel data travels. Two
+other, separate mechanisms also cross this boundary, each narrower and
+lower-frequency than frame delivery:
+
+- The stop flag (`std::atomic<bool> stopRequested`, §7) — written by
+  whichever thread requests a stop, read by the worker loop and by the
+  interrupt callback. Carries no frame data, just a boolean.
+- A low-frequency connection-state notification (`Connecting` / `Connected`
+  / `Error` / `Stopped`) via a normal Qt queued signal that carries no frame
+  payload — it fires on state transitions, not per frame.
+
+No FFmpeg type (`AVPacket`, `AVFrame`, `AVFormatContext`, `AVCodecContext`)
+ever crosses the thread boundary, and the worker never emits one Qt signal
+per decoded frame (§3, §5).
 
 ## 2. Modules and class responsibilities
 
@@ -47,15 +65,36 @@ emits one Qt signal per decoded frame (§3, §5).
   the format context on destruction.
 
 - **`Decoder`**
-  Owns the FFmpeg `AVCodecContext` for the video stream. Responsible for
-  sending packets (`avcodec_send_packet`) and receiving decoded frames
-  (`avcodec_receive_frame`). Closes the codec context on destruction.
+  Owns the FFmpeg `AVCodecContext` for the video stream. Sends packets
+  belonging to the selected video stream (`avcodec_send_packet`) and receives
+  decoded frames (`avcodec_receive_frame`). The relationship between packets
+  and frames is **not** 1:1 — a single `avcodec_send_packet` call can make
+  zero, one, or more frames available (e.g. B-frame reordering), so the loop
+  is conceptually:
+  ```
+  read packet
+  → if it belongs to the selected video stream:
+      avcodec_send_packet()
+      → repeatedly avcodec_receive_frame()
+        until EAGAIN / EOF / error
+  → release packet
+  → continue
+  ```
+  Packets belonging to any other stream (e.g. audio) are released/unref'd and
+  skipped without being sent to the decoder. Closes the codec context on
+  destruction.
 
 - **`FrameConverter`**
   Wraps `sws_scale` to convert a decoded YUV `AVFrame` into a `VideoFrame`
-  (§4). Owns the `SwsContext` (recreated if frame dimensions change) and is
-  responsible for allocating each `VideoFrame`'s pixel buffer. Stateless
-  otherwise.
+  (§4). Tracks the source **width, height, and pixel format** of the frames
+  it has converted; if any of those three change between calls (e.g. the
+  stream renegotiates resolution or pixel format mid-stream), it
+  recreates/reconfigures its `SwsContext` before converting, rather than
+  reusing a context built for the old parameters. It is responsible for
+  allocating each `VideoFrame`'s pixel buffer, and is otherwise stateless —
+  always converting to the same fixed output pixel format. This is
+  intentionally narrow (three tracked fields, one `SwsContext`) and not a
+  general media-format abstraction.
 
 - **`VideoFrame`** (application-owned, crosses the thread boundary — §4)
   A plain, move-only value type: owned pixel buffer plus width, height,
@@ -145,12 +184,20 @@ for the one object type that actually crosses threads.
 5. On a `QTimer` tick, `FrameQueue::tryPopLatest()` moves the newest
    `VideoFrame` out to the UI thread; any older frame(s) it skips over in the
    same call are destroyed at that point, not returned (§5).
-6. `VideoDisplayItem` holds the popped `VideoFrame` as "currently displayed"
-   (used to paint; may be wrapped in a `QImage` without necessarily copying
-   the buffer — an implementation-time choice, not fixed here) until the next
-   tick produces a new one, at which point the previous `VideoFrame` is
-   destroyed, deterministically freeing its buffer. No manual `delete`
-   anywhere in this path — every step is RAII/move.
+6. `VideoDisplayItem` holds the popped `VideoFrame` as "currently displayed."
+   **Phase 1 display-buffer policy (deliberately simple, not an
+   optimization):** `VideoFrame` owns its pixel buffer until the UI has
+   consumed it. While that `VideoFrame` is still alive, the UI creates its
+   own independent `QImage` — with `QImage`'s own copied pixel data, not a
+   view over the `VideoFrame`'s buffer — and only once that independent copy
+   exists is the previous `VideoFrame` destroyed, deterministically freeing
+   its buffer. No manual `delete` anywhere in this path — every step is
+   RAII/move. This costs one extra copy per displayed frame (`VideoFrame`
+   buffer → `QImage`'s own buffer), accepted for Phase 1 because it keeps
+   buffer ownership completely unambiguous. A zero-copy or shared-backing-
+   storage approach may be revisited later, but only if profiling shows this
+   copy is a measured, meaningful bottleneck (consistent with D5's "optimize
+   only after measurement").
 
 ## 5. Bounded `FrameQueue`: capacity and policy
 
@@ -158,15 +205,24 @@ for the one object type that actually crosses threads.
 
 Reasoning: the queue's job is only to absorb the small timing gap between
 "worker just decoded a frame" and "UI's next timer tick," not to buffer a
-backlog. A capacity of 1 (a single "latest frame" slot) is tempting but makes
-every push/pop a potential contention point with no slack at all; a capacity
-of 2 gives one frame of slack so a push landing just before a pop doesn't
-need to fight for it, while still bounding worst-case memory to two frames
-(at 1080p RGB32, ~8 MB each → ~16 MB worst case) and making it structurally
-impossible for a backlog to build no matter how long the UI thread stalls.
-There is no measurement behind a larger number, and the project's rule is not
-to add capacity speculatively — 2 is the smallest number that removes
-needless self-contention.
+backlog. Capacity 2 was chosen as an initial design choice for these reasons:
+
+- **Bounded memory:** worst-case memory is fixed at two frames (at 1080p
+  RGB32, ~8 MB each → ~16 MB worst case), regardless of how long the stream
+  runs.
+- **Bounded live-view latency:** with drop-oldest/latest-wins, the UI is
+  never more than a couple of frames behind "now."
+- **Absorbs a very small producer/consumer timing mismatch:** one frame of
+  slack lets a push landing just before a pop, or vice versa, proceed without
+  either side waiting on the other.
+- **Old frames remain disposable:** anything beyond the newest frame is
+  stale for a live view and safe to drop.
+
+This is an initial value, not a measured one — no profiling has been done to
+justify it over 1 or 3, and the project's rule is not to add capacity
+speculatively. It may change if Phase 1 testing/measurement gives a concrete
+reason to. (Note: capacity 2 is not claimed to reduce lock contention —
+that would require measurement that hasn't been done.)
 
 **Push policy (worker → queue):** if the queue is at capacity, drop the
 oldest queued `VideoFrame` and push the new one. The worker never blocks
@@ -193,10 +249,12 @@ Phase 1 testing shows a reason to.
   (`Error`), not a crash. No retry logic exists in Phase 1 — see §7 for why,
   and D8 for the decision to explicitly exclude automatic reconnection.
 - **Mid-stream network drop:** detected either by `av_read_frame` returning
-  an error, or by the interrupt callback firing due to a configured network
-  timeout (§7) when the connection has silently gone dead. Either way, the
-  worker transitions to `Error`, stops pushing frames, and exits its loop. It
-  does **not** automatically retry or reconnect.
+  an error, or by the separate RTSP/network-level timeout (§7) expiring
+  because the connection has silently gone dead. This timeout is a distinct
+  safeguard from the interrupt callback (§7) — it is not "the interrupt
+  callback firing due to a timeout." Either way, the worker transitions to
+  `Error`, stops pushing frames, and exits its loop. It does **not**
+  automatically retry or reconnect.
 - **Decode error on a single frame/packet:** log and skip; do not stop the
   whole stream for one bad frame.
 - **Fatal/unexpected errors:** worker transitions to `Error`, stops cleanly
@@ -214,7 +272,23 @@ mid-call. The only supported way to unblock them is FFmpeg's own interrupt
 mechanism, so shutdown is built around that rather than any form of forced
 thread termination.
 
-**Mechanism:**
+**Two separate safeguards.** Phase 1 relies on two distinct mechanisms that
+must not be conflated:
+
+- **Manual stop:**
+  `stopRequested` set → `AVIOInterruptCB` returns non-zero on its next poll →
+  FFmpeg aborts the in-progress blocking call (I/O aborts).
+- **Network timeout:**
+  a separate RTSP/network-level timeout (an `AVDictionary` option, not the
+  interrupt callback) prevents a connection that has gone silently dead from
+  blocking indefinitely, even when no stop has been requested.
+
+These exist for different reasons and fire independently of each other: the
+interrupt callback is how an explicit stop request reaches a blocked FFmpeg
+call; the network timeout is what protects against a dead connection when
+*no one has asked to stop at all*.
+
+**Mechanism — manual stop (interrupt callback):**
 
 - `CaptureWorker` owns an `std::atomic<bool> stopRequested`.
 - `RtspSource` pre-allocates its `AVFormatContext` with
@@ -226,16 +300,18 @@ thread termination.
   (during both `avformat_open_input` and `av_read_frame`). When it returns
   non-zero, FFmpeg aborts the in-progress operation and returns an error
   (e.g. `AVERROR_EXIT`) instead of continuing to block.
-- In addition to the interrupt callback, `RtspSource` sets an RTSP-level
-  socket/read timeout (an `AVDictionary` option passed to
-  `avformat_open_input`, e.g. a `stimeout`/`rw_timeout`-style option — exact
-  key depends on the FFmpeg version used, to be confirmed at implementation
-  time). This is a **safety net for a connection that goes silently dead
-  with no stop requested** — without it, a dead socket with no data and no
-  explicit stop could block `av_read_frame` indefinitely. When this timeout
-  fires (as opposed to the interrupt callback firing from a stop request),
-  it is treated as the mid-stream network drop case in §6 (`Error`, no
-  auto-reconnect) — not as a shutdown.
+
+**Mechanism — network timeout (independent safety net):**
+
+- `RtspSource` also sets an RTSP-level socket/read timeout (an
+  `AVDictionary` option passed to `avformat_open_input`, e.g. a
+  `stimeout`/`rw_timeout`-style option — exact key TBD, to be confirmed
+  during Phase 1 Step 0). This is a **safety net for a connection that goes
+  silently dead with no stop requested** — without it, a dead socket with no
+  data and no explicit stop could block `av_read_frame` indefinitely.
+- When this timeout fires, it is *not* the interrupt callback firing and it
+  is *not* a shutdown — it is treated as the mid-stream network drop case in
+  §6 (`Error`, no auto-reconnect).
 
 **Shutdown sequence:**
 
@@ -251,7 +327,10 @@ thread termination.
 5. `CaptureWorker` joins the worker thread. This join is now bounded by "one
    interrupt-callback poll interval," not by a full network timeout or an
    indefinite hang.
-6. Any `VideoFrame`s remaining in `FrameQueue` are destroyed (buffers freed).
+6. Any `VideoFrame`s remaining in `FrameQueue` are destroyed (buffers freed),
+   and the UI's currently-displayed frame and connection-state are
+   cleared/reset to an idle/disconnected state — no stale video frame from
+   the previous session is left on screen.
 7. The state signal reports `Stopped` (a user-requested stop is a distinct
    terminal state from `Error` — it is not something to reconnect from).
 
@@ -260,9 +339,26 @@ either it is between blocking calls and sees the stop flag directly, or it is
 inside a blocking call that the interrupt callback (backed, worst case, by
 the network timeout) will unblock.
 
+**Stop → Start sequencing.** A new capture session must never begin until
+the previous worker thread has completely exited and been joined — Phase 1
+never has two worker threads alive for the same view at once. Restated as an
+explicit sequence:
+
+```
+stop request
+→ interrupt FFmpeg (§7 mechanisms above)
+→ worker exits its loop
+→ CaptureWorker joins the worker thread   (step 5 above — must complete
+                                            before anything below happens)
+→ FrameQueue is cleared
+→ displayed frame / connection-state is cleared/reset
+→ only now may a new worker be started
+```
+
 **Explicitly not implemented in Phase 1:** automatic reconnection. An `Error`
 or a `Stopped` state both simply end the current stream session; starting
-again is a new, explicit user action. (See D8.)
+again is always a new, explicit user action, and only after the join above
+has completed. (See D8.)
 
 ## 8. Concurrency hazards considered
 

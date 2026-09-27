@@ -150,7 +150,11 @@ drop-oldest on push, latest-wins on pop). The UI thread consumes frames by
 polling `FrameQueue` from a fixed-interval `QTimer`, not by reacting to a
 per-frame signal. The worker's only Qt signal is a low-frequency
 connection-state change (`Connecting`/`Connected`/`Error`/`Stopped`) with no
-frame payload.
+frame payload. `FrameQueue` is specifically the channel for **video frame
+data** — it is not the only thing shared across the worker/UI boundary. The
+stop flag (`std::atomic<bool>`, D8) and this connection-state signal are
+separate, lower-frequency control/state mechanisms that also cross the
+boundary, and neither carries frame data.
 
 **Reason:** Qt's queued signal/slot mechanism delivers through the receiving
 thread's event queue, which has no capacity limit of its own. Emitting one
@@ -224,11 +228,13 @@ at 2.
 thread and `FrameQueue` never need to know about FFmpeg's reference-counting
 rules (`av_frame_unref`, buffer pools, etc.) at all — the ownership story for
 the object that actually crosses threads is entirely in application code and
-as simple as "one owned buffer, moved." A capacity of 2 was chosen over 1
-(no slack — every push/pop is a potential contention point) and over
-anything larger (no measurement justifies more buffering, and more capacity
-only means a bigger possible backlog of stale frames, which the pop policy
-already discards anyway) — see `docs/ARCHITECTURE.md` §5.
+as simple as "one owned buffer, moved." A capacity of 2 was chosen as an
+initial value for bounded memory, bounded live-view latency, absorbing a
+very small producer/consumer timing mismatch, and because old frames remain
+disposable under the drop-oldest/latest-wins policy — not because it is
+claimed to reduce lock contention (that would require measurement that
+hasn't been done). It may change if Phase 1 testing gives a concrete reason
+to — see `docs/ARCHITECTURE.md` §5.
 
 **Alternatives considered:** Passing `AVFrame*` (or a ref-counted wrapper
 around one) directly into `FrameQueue` and doing the YUV→RGB conversion on
@@ -240,3 +246,31 @@ might avoid. Accepted: it buys a clean, FFmpeg-free ownership model at the
 one point where two threads actually touch the same data, which matters more
 in Phase 1 than the cost of one conversion per frame — revisit only if
 measurement shows this conversion is a real bottleneck (consistent with D5).
+
+---
+
+## D10 — Phase 1 display-buffer policy: `VideoFrame` owns its buffer until the UI makes its own independent `QImage` copy
+
+**Decision:** `VideoFrame` (D9) owns its pixel buffer until the UI thread has
+consumed it. `VideoDisplayItem` constructs its own independent `QImage` —
+with `QImage`'s own copied pixel data, not a view over the `VideoFrame`'s
+buffer — while that `VideoFrame` is still alive. Only after that independent
+copy exists is the previous `VideoFrame` destroyed.
+
+**Reason:** This keeps pixel-buffer ownership completely unambiguous at the
+one point where "who owns this memory right now" would otherwise be easy to
+get wrong (a `QImage` wrapping foreign memory without copying it requires the
+wrapped buffer to outlive the `QImage`, which is exactly the kind of lifetime
+coupling this project's ownership rules try to avoid). Simplicity and
+correctness are prioritized over avoiding a copy, matching the project's
+"measure before optimizing" rule.
+
+**Alternatives considered:** Wrap the `VideoFrame`'s buffer directly in a
+`QImage` with a no-op cleanup function (zero-copy), coupling the `QImage`'s
+validity to the `VideoFrame`'s lifetime.
+
+**Trade-offs:** One extra pixel-buffer copy per displayed frame
+(`VideoFrame` buffer → `QImage`'s own buffer). Accepted for Phase 1 because
+ownership stays unambiguous; a zero-copy/shared-backing-storage approach may
+be revisited only if profiling shows this copy is a measured, meaningful
+bottleneck (consistent with D5).

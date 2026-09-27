@@ -5,7 +5,8 @@ previous phase meets its completion criteria and the user has approved moving
 on. Do not implement or design ahead of the current phase — see the
 development rules in `CLAUDE.md`.
 
-**Current phase: Phase 1 (not yet started — design/docs stage).**
+**Current phase: Phase 0 (documentation/design stage — in progress).**
+Phase 1 (implementation) has not started.
 
 ## Phase 0 — Project definition (this stage)
 
@@ -25,6 +26,10 @@ development rules in `CLAUDE.md`.
   `docs/ARCHITECTURE.md`. One stream, one capture/decode thread, one Qt UI
   thread, bounded frame queue, basic connect/stop/error states. No
   multi-channel, OpenCV, SQLite, REST/WebSocket, or MCP.
+- **Step 0 (environment setup):** Exact toolchain versions (MSVC, CMake, Qt,
+  FFmpeg) are **TBD** — not fixed by this documentation. They are to be
+  selected and verified at the start of Phase 1 implementation, before any
+  pipeline code is written, and recorded in `docs/DECISIONS.md` once chosen.
 - **Completion criteria:**
   - App connects to a real RTSP URL and displays live decoded video.
   - Stopping the stream and closing the app both shut down cleanly (no

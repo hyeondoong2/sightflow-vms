@@ -43,4 +43,9 @@ Read before working:
 
 ## Current status
 
-No source code, build system, or dependencies exist yet. This repository currently contains only documentation (`docs/`) and this file. Do not create `src/`, `CMakeLists.txt`, or any implementation files until the user explicitly asks to begin Phase 1 implementation.
+**Currently in Phase 0 (documentation/design stage) — see `docs/ROADMAP.md`.**
+Phase 1 (implementation of the single RTSP stream viewer) has not started. No
+source code, build system, or dependencies exist yet. This repository
+currently contains only documentation (`docs/`) and this file. Do not create
+`src/`, `CMakeLists.txt`, or any implementation files until the user
+explicitly asks to begin Phase 1 implementation.
