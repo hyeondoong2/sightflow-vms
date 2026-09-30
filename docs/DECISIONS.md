@@ -274,3 +274,83 @@ validity to the `VideoFrame`'s lifetime.
 ownership stays unambiguous; a zero-copy/shared-backing-storage approach may
 be revisited only if profiling shows this copy is a measured, meaningful
 bottleneck (consistent with D5).
+
+---
+
+## D11 — Before the worker thread exists, the console orchestrator (not `RtspSource`/`Decoder`) owns `AVPacket`/`AVFrame`
+
+**Decision:** In the current single-threaded console step (no `CaptureWorker`
+yet), the code driving the read/decode loop allocates one `AVPacket` and one
+`AVFrame` and reuses each for the life of the run (RAII-freed at scope exit).
+`RtspSource::readPacket(AVPacket*)` and `Decoder::receiveFrame(AVFrame*)` are
+thin pass-throughs with the same signature as `av_read_frame`/
+`avcodec_receive_frame` — they fill a caller-owned buffer and do not hold or
+own it themselves. `docs/ARCHITECTURE.md` §1's data-flow diagram annotates
+these as "owned by `RtspSource`" / "owned by `Decoder`"; that describes the
+eventual `CaptureWorker`-based design, not this step's orchestrator, and a
+clarifying note was added there pointing back to this entry.
+
+**Reason:** This step's scope is decode/convert correctness in a
+single-threaded console program, not the worker-thread architecture. Having
+`RtspSource`/`Decoder` internally store the packet/frame would require them
+to manage buffer lifetime across calls for no current benefit — the
+orchestrator already needs the buffer alive across the `send`/`receive` and
+`unref` sequence, and passing it in directly keeps both classes simple
+mirrors of the underlying FFmpeg calls they wrap. Restructuring them to own
+these buffers now would be designing ahead of the not-yet-built worker
+thread, which the project's rules avoid.
+
+**Alternatives considered:** Have `RtspSource` allocate and own the
+`AVPacket` internally, returning a reference/pointer from `readPacket()`;
+have `Decoder` allocate and own the `AVFrame` internally, returning it from
+`receiveFrame()`. Both were rejected for now as unnecessary structural
+change for this step — revisit when `CaptureWorker` is actually built, since
+its ownership needs may differ once threading and `FrameQueue` exist.
+
+**Trade-offs:** The current code's ownership doesn't literally match the
+target diagram in `docs/ARCHITECTURE.md` §1, which could mislead a reader who
+doesn't also read this entry. Mitigated by the clarifying note added at the
+diagram. Object lifetimes today: the single `AVPacket` and `AVFrame` each
+live for the whole run (allocated once before the loop, unref'd every
+iteration/every code path, freed via RAII at `main`'s scope exit); the
+`AVFormatContext` (owned by `RtspSource`) and `AVCodecContext` (owned by
+`Decoder`) each live for the lifetime of their owning object, unaffected by
+this decision.
+
+---
+
+## D12 — `FrameConverter` output format is `BGRA32`; `SwsContext` lifecycle uses `sws_getCachedContext`
+
+**Decision:** `FrameConverter` always converts to
+`VideoFrame::PixelFormat::BGRA32` — packed, 4 bytes per pixel, in-memory byte
+order per pixel `B, G, R, A` (little-endian), no row padding
+(`strideBytes() == width() * 4`). Its pixel buffer is a plain
+`std::vector<uint8_t>` allocated by `FrameConverter` itself and written to
+directly by `sws_scale`, never FFmpeg-owned memory. Conversion never resizes
+(`sws_scale` runs at the source frame's own width/height — color-space
+conversion only). `FrameConverter` recreates/reuses its `SwsContext` via
+FFmpeg's `sws_getCachedContext` (ownership passed in via `release()`, result
+captured via `reset()`) rather than manually tracking source width/height/
+pixel format itself.
+
+**Reason:** `BGRA32`'s in-memory byte order matches Qt's
+`QImage::Format_RGB32`/`Format_ARGB32` on a little-endian machine (Qt's
+0xAARRGGBB value is stored in memory as bytes B, G, R, A), so the eventual
+Phase 1 display step (D10) can build a `QImage` directly over this layout
+with no channel reordering — consistent with D9's "e.g. RGB32" example.
+Using `sws_getCachedContext` for the recreate-on-change behavior avoids
+`FrameConverter` re-implementing a comparison FFmpeg already provides;
+`docs/ARCHITECTURE.md` §2 describes the required behavior (recreate when
+width/height/pixel format change) without mandating a specific mechanism.
+
+**Alternatives considered:** Producing `RGBA32` (byte order R,G,B,A) —
+rejected, its bytes don't match any native `QImage` format on a
+little-endian machine, requiring an extra channel swap later. Manually
+tracking source width/height/pixel format as three fields and calling
+`sws_getContext`/`sws_freeContext` directly — rejected as duplicating logic
+`sws_getCachedContext` already implements correctly.
+
+**Trade-offs:** None identified beyond what D10 already accepts (one copy
+per frame into `VideoFrame`'s own buffer). If a future phase needs a
+different pixel format (e.g. a GPU path per D5's revisit condition), this
+decision would need to be revisited alongside D5/D9/D10.

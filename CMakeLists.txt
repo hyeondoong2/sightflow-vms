@@ -9,6 +9,9 @@ find_package(FFMPEG REQUIRED)
 
 add_executable(sightflow-vms
     src/main.cpp
+    src/RtspSource.cpp
+    src/Decoder.cpp
+    src/FrameConverter.cpp
 )
 
 target_include_directories(sightflow-vms PRIVATE ${FFMPEG_INCLUDE_DIRS})

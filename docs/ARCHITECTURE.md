@@ -37,6 +37,19 @@ RTSP URL
      → VideoDisplayItem displays it, previous VideoFrame is destroyed
 ```
 
+**Current implementation state vs. this diagram.** The diagram above is the target
+design once `CaptureWorker`/`FrameQueue`/the Qt UI thread exist. The Phase 1
+implementation so far is a single-threaded console step building up to that:
+there is no worker thread yet, and the `AVPacket`/`AVFrame` buffers are
+allocated once and owned by the console orchestrator (the code that will
+become `CaptureWorker`'s loop), not by `RtspSource`/`Decoder` themselves —
+`RtspSource::readPacket()`/`Decoder::receiveFrame()` are thin pass-throughs
+with the same signature as `av_read_frame`/`avcodec_receive_frame`, filling a
+caller-owned buffer rather than returning one they own. See D11 in
+`docs/DECISIONS.md` for why, and the "owned by RtspSource"/"owned by Decoder"
+annotations above describe the eventual `CaptureWorker` design, not the
+current orchestrator's variable names.
+
 `FrameQueue` (§4–5) is the only channel used to transfer **video frame data**
 across the worker/UI thread boundary — it is not the only thing shared
 between the two threads, just the only path frame pixel data travels. Two
@@ -85,15 +98,20 @@ per decoded frame (§3, §5).
   destruction.
 
 - **`FrameConverter`**
-  Wraps `sws_scale` to convert a decoded YUV `AVFrame` into a `VideoFrame`
-  (§4). Tracks the source **width, height, and pixel format** of the frames
-  it has converted; if any of those three change between calls (e.g. the
-  stream renegotiates resolution or pixel format mid-stream), it
-  recreates/reconfigures its `SwsContext` before converting, rather than
-  reusing a context built for the old parameters. It is responsible for
-  allocating each `VideoFrame`'s pixel buffer, and is otherwise stateless —
-  always converting to the same fixed output pixel format. This is
-  intentionally narrow (three tracked fields, one `SwsContext`) and not a
+  Wraps `sws_scale` to convert a decoded `AVFrame` into a `VideoFrame` (§4),
+  always at the source frame's own width/height (color-space conversion only,
+  no resizing) and always into the single fixed output format
+  `VideoFrame::PixelFormat::BGRA32` (D12). It is responsible for allocating
+  each `VideoFrame`'s pixel buffer as a plain `std::vector<uint8_t>` — never
+  FFmpeg-owned memory — and copying `sws_scale`'s output directly into it, so
+  the returned `VideoFrame` is independent of the source `AVFrame` and stays
+  valid after that `AVFrame` is unref'd. If the source width, height, or
+  pixel format changes between calls (e.g. the stream renegotiates
+  resolution mid-stream), its `SwsContext` is recreated: this is delegated to
+  FFmpeg's own `sws_getCachedContext`, which reuses the existing context when
+  parameters are unchanged and transparently frees/reallocates it otherwise,
+  rather than `FrameConverter` hand-tracking those fields itself (D12). This
+  is intentionally narrow (one `SwsContext`, one output format) and not a
   general media-format abstraction.
 
 - **`VideoFrame`** (application-owned, crosses the thread boundary — §4)
@@ -158,9 +176,9 @@ No `AVFrame` or other FFmpeg-owned memory crosses the thread boundary.
 VideoFrame
   width         : int
   height        : int
-  strideBytes   : int              // bytes per row; may exceed width * bytesPerPixel
-  pixelFormat   : VideoFrame::Format  // app-level enum, e.g. RGB32 — the one format
-                                       // FrameConverter is asked to produce
+  strideBytes   : int              // bytes per row; == width * 4 for BGRA32 (no padding)
+  pixelFormat   : VideoFrame::PixelFormat  // app-level enum; BGRA32 is the one format
+                                            // FrameConverter produces (D12)
   pixels        : owned buffer      // sole owner of the memory; freed on destruction
 ```
 
