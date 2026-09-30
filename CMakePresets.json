@@ -1,0 +1,34 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 23, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-vcpkg",
+      "displayName": "Windows (MSVC, vcpkg, Ninja Multi-Config)",
+      "description": "Requires the VCPKG_ROOT environment variable to point at a local vcpkg checkout. Visual Studio's Open Folder / CMake integration only supports the Ninja generators, not the 'Visual Studio ...' generators.",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/../sightflow-vms-build-vs-ninja",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl.exe",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-vcpkg-debug",
+      "configurePreset": "windows-vcpkg",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-vcpkg-release",
+      "configurePreset": "windows-vcpkg",
+      "configuration": "Release"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "sightflow-vms",
+  "version": "0.1.0",
+  "builtin-baseline": "489ec93b13cf7d1dc4f0b5e69ad636ec927217e3",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "swscale"
+      ]
+    }
+  ]
+}
