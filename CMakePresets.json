@@ -17,6 +17,17 @@
         "CMAKE_CXX_COMPILER": "cl.exe",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
+    },
+    {
+      "name": "windows-vcpkg-vs2022",
+      "displayName": "Windows (MSVC v143 / VS2022, vcpkg, Ninja Multi-Config, Qt6)",
+      "description": "Same as 'windows-vcpkg', pinned to the VS2022 v143 toolset (this machine also has a newer VS install whose default toolset is not Qt-ABI-compatible with prebuilt Qt6 'msvc2022_64' binaries, so the toolset must be pinned explicitly). Needs a Qt6 'msvc2022_64' kit: point CMake at it per-machine by setting the 'Qt6_DIR' environment variable to '<your Qt6 kit>/lib/cmake/Qt6' (CMake's own find_package(Qt6) convention) -- intentionally not recorded here so this file has no machine-specific path.",
+      "inherits": "windows-vcpkg",
+      "binaryDir": "${sourceDir}/../sightflow-vms-build-vs2022-msvc143",
+      "toolset": {
+        "value": "v143",
+        "strategy": "external"
+      }
     }
   ],
   "buildPresets": [
@@ -28,6 +39,16 @@
     {
       "name": "windows-vcpkg-release",
       "configurePreset": "windows-vcpkg",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-vcpkg-vs2022-debug",
+      "configurePreset": "windows-vcpkg-vs2022",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-vcpkg-vs2022-release",
+      "configurePreset": "windows-vcpkg-vs2022",
       "configuration": "Release"
     }
   ]
