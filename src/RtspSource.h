@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -13,10 +14,18 @@ extern "C" {
 // video stream, and reads AVPackets from it.
 class RtspSource {
 public:
+    // `stopRequested` must outlive this RtspSource (owned by the worker that
+    // opens it, e.g. CaptureWorker). Installed as the AVFormatContext's
+    // interrupt callback before avformat_open_input, so a stop request can
+    // abort both the initial connection handshake and any later
+    // readPacket() call that's blocked in network I/O.
+    //
     // Returns nullptr and fills errorOut with a ready-to-print message on
     // failure. Every FFmpeg resource allocated during a failed attempt is
     // released before returning.
-    static std::unique_ptr<RtspSource> open(const std::string& url, std::string& errorOut);
+    static std::unique_ptr<RtspSource> open(const std::string& url,
+                                             const std::atomic<bool>& stopRequested,
+                                             std::string& errorOut);
 
     RtspSource(const RtspSource&) = delete;
     RtspSource& operator=(const RtspSource&) = delete;
@@ -43,7 +52,11 @@ private:
     // Does the actual opening work on an already-constructed (empty) object.
     // Returns false and fills errorOut on failure; whatever was already
     // acquired is cleaned up when the caller destroys this object.
-    bool openInternal(const std::string& url, std::string& errorOut);
+    bool openInternal(const std::string& url, const std::atomic<bool>& stopRequested, std::string& errorOut);
+
+    // FFmpeg's AVIOInterruptCB callback: returns non-zero (abort) once
+    // `opaque` (a const std::atomic<bool>*) reads true.
+    static int interruptCallback(void* opaque);
 
     NetworkGuard network_;
     FormatContextPtr fmtCtx_;

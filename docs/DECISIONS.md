@@ -354,3 +354,45 @@ tracking source width/height/pixel format as three fields and calling
 per frame into `VideoFrame`'s own buffer). If a future phase needs a
 different pixel format (e.g. a GPU path per D5's revisit condition), this
 decision would need to be revisited alongside D5/D9/D10.
+
+---
+
+## D13 — `CaptureWorker` built: confirms D11's local-buffer ownership; fixes the RTSP timeout option key from `stimeout` to `timeout`
+
+**Decision:** `CaptureWorker` (owning the stop flag and worker thread, per
+D8/§7) now exists, running the RTSP connect/read/decode/convert loop on its
+own thread. As D11 anticipated, `RtspSource`/`Decoder`/`FrameConverter` and
+the `AVPacket`/`AVFrame` buffers are all local to `CaptureWorker::run()`'s
+stack — none of them became members of `RtspSource`/`Decoder` themselves;
+only the resulting `VideoFrame` crosses into `FrameQueue`. D11 stands
+unchanged. Separately, while wiring `RtspSource`'s `AVIOInterruptCB` (D8),
+the RTSP-level socket timeout option key was checked against the actual
+FFmpeg this project links (vcpkg `ffmpeg` 8.1): enumerating the linked
+`rtsp` demuxer's `AVOption` array directly (`av_find_input_format("rtsp")
+->priv_class->option`) shows it exposes `"timeout"` (int64, microseconds)
+and has **no** `"stimeout"` option at all. `RtspSource::openInternal()` is
+updated from `"stimeout"` to `"timeout"`.
+
+**Reason:** `av_dict_set` on an unrecognized private option is not an error
+— `avformat_open_input` simply leaves it unconsumed in the dictionary — so
+the previous `"stimeout"` key was silently doing nothing; the §7 network-
+timeout safety net was never actually active. `"stimeout"` was the option's
+name in older FFmpeg releases and was later renamed to `"timeout"`; since
+this project always builds against whatever FFmpeg vcpkg currently resolves
+(no pinned historical version), checking the option list of the actual
+linked library is the only reliable way to know which key is live, rather
+than trusting the option name from memory or from a specific historical
+FFmpeg version's documentation.
+
+**Alternatives considered:** Setting both `"stimeout"` and `"timeout"` in the
+options dictionary to be version-agnostic — rejected as unnecessary
+complexity for a single pinned dependency version (vcpkg's manifest mode
+already pins an exact `ffmpeg` build via `builtin-baseline` in
+`vcpkg.json`); if that baseline is ever bumped and reintroduces this
+mismatch, the same enumeration check should be re-run rather than
+defensively setting both keys forever.
+
+**Trade-offs:** None — this is a correctness fix with no downside. Verified
+via a temporary throwaway program (deleted after use, not part of the
+shipped build) that printed the linked `rtsp` demuxer's full `AVOption`
+list; see the conversation this decision was made in for that output.

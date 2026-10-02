@@ -6,16 +6,24 @@ extern "C" {
 #include <libavutil/dict.h>
 }
 
-std::unique_ptr<RtspSource> RtspSource::open(const std::string& url, std::string& errorOut)
+std::unique_ptr<RtspSource> RtspSource::open(const std::string& url,
+                                              const std::atomic<bool>& stopRequested,
+                                              std::string& errorOut)
 {
     std::unique_ptr<RtspSource> source(new RtspSource());
-    if (!source->openInternal(url, errorOut)) {
+    if (!source->openInternal(url, stopRequested, errorOut)) {
         return nullptr; // destroying `source` here releases whatever it already acquired
     }
     return source;
 }
 
-bool RtspSource::openInternal(const std::string& url, std::string& errorOut)
+int RtspSource::interruptCallback(void* opaque)
+{
+    const auto* stopRequested = static_cast<const std::atomic<bool>*>(opaque);
+    return (stopRequested && stopRequested->load()) ? 1 : 0;
+}
+
+bool RtspSource::openInternal(const std::string& url, const std::atomic<bool>& stopRequested, std::string& errorOut)
 {
     AVFormatContext* rawFmtCtx = avformat_alloc_context();
     if (!rawFmtCtx) {
@@ -23,9 +31,17 @@ bool RtspSource::openInternal(const std::string& url, std::string& errorOut)
         return false;
     }
 
+    // Installed before avformat_open_input so even the initial connection
+    // handshake is interruptible, not just later av_read_frame calls.
+    rawFmtCtx->interrupt_callback.callback = &RtspSource::interruptCallback;
+    rawFmtCtx->interrupt_callback.opaque = const_cast<void*>(static_cast<const void*>(&stopRequested));
+
     AVDictionary* options = nullptr;
     av_dict_set(&options, "rtsp_transport", "tcp", 0);
-    av_dict_set(&options, "stimeout", "5000000", 0); // 5s connect/read timeout (microseconds)
+    // Socket I/O timeout (microseconds): the linked FFmpeg's rtsp demuxer
+    // exposes this as "timeout", not the older "stimeout" name (confirmed by
+    // enumerating its actual AVOptions against this project's vcpkg ffmpeg).
+    av_dict_set(&options, "timeout", "5000000", 0); // 5s
 
     int ret = avformat_open_input(&rawFmtCtx, url.c_str(), nullptr, &options);
     av_dict_free(&options);

@@ -37,18 +37,22 @@ RTSP URL
      → VideoDisplayItem displays it, previous VideoFrame is destroyed
 ```
 
-**Current implementation state vs. this diagram.** The diagram above is the target
-design once `CaptureWorker`/`FrameQueue`/the Qt UI thread exist. The Phase 1
-implementation so far is a single-threaded console step building up to that:
-there is no worker thread yet, and the `AVPacket`/`AVFrame` buffers are
-allocated once and owned by the console orchestrator (the code that will
-become `CaptureWorker`'s loop), not by `RtspSource`/`Decoder` themselves —
-`RtspSource::readPacket()`/`Decoder::receiveFrame()` are thin pass-throughs
-with the same signature as `av_read_frame`/`avcodec_receive_frame`, filling a
-caller-owned buffer rather than returning one they own. See D11 in
-`docs/DECISIONS.md` for why, and the "owned by RtspSource"/"owned by Decoder"
-annotations above describe the eventual `CaptureWorker` design, not the
-current orchestrator's variable names.
+**Current implementation state vs. this diagram.** `CaptureWorker` now exists
+and owns the dedicated capture/decode worker thread and the stop-request flag,
+matching this diagram's left-hand box. The Qt UI thread does not exist yet —
+`main.cpp` is a temporary console harness that starts `CaptureWorker`, polls
+`FrameQueue::tryPopLatest()` on a fixed interval to print frame info (standing
+in for the eventual `QTimer`-driven `VideoDisplayItem`), and then requests
+stop; see D13 in `docs/DECISIONS.md`. The `AVPacket`/`AVFrame` buffers are
+still allocated once and owned locally within `CaptureWorker::run()`'s stack
+(not by `RtspSource`/`Decoder` themselves) — `RtspSource::readPacket()`/
+`Decoder::receiveFrame()` remain thin pass-throughs with the same signature as
+`av_read_frame`/`avcodec_receive_frame`, filling a caller-owned buffer rather
+than returning one they own. See D11 in `docs/DECISIONS.md` for why this
+still holds now that `CaptureWorker` exists, and the "owned by
+RtspSource"/"owned by Decoder" annotations above describe that same intent —
+the object that owns the *loop* those buffers live in, not a claim that
+`RtspSource`/`Decoder` store them as member state.
 
 `FrameQueue` (§4–5) is the only channel used to transfer **video frame data**
 across the worker/UI thread boundary — it is not the only thing shared
@@ -322,11 +326,14 @@ call; the network timeout is what protects against a dead connection when
 **Mechanism — network timeout (independent safety net):**
 
 - `RtspSource` also sets an RTSP-level socket/read timeout (an
-  `AVDictionary` option passed to `avformat_open_input`, e.g. a
-  `stimeout`/`rw_timeout`-style option — exact key TBD, to be confirmed
-  during Phase 1 Step 0). This is a **safety net for a connection that goes
-  silently dead with no stop requested** — without it, a dead socket with no
-  data and no explicit stop could block `av_read_frame` indefinitely.
+  `AVDictionary` option passed to `avformat_open_input`): the key is
+  `"timeout"` (int64 microseconds), confirmed by enumerating the linked
+  FFmpeg's `rtsp` demuxer `AVOption`s directly (see D13 in
+  `docs/DECISIONS.md`) — the older `"stimeout"` name is not recognized by
+  this project's FFmpeg version and would have silently done nothing. This
+  is a **safety net for a connection that goes silently dead with no stop
+  requested** — without it, a dead socket with no data and no explicit stop
+  could block `av_read_frame` indefinitely.
 - When this timeout fires, it is *not* the interrupt callback firing and it
   is *not* a shutdown — it is treated as the mid-stream network drop case in
   §6 (`Error`, no auto-reconnect).

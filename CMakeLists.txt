@@ -12,6 +12,8 @@ add_executable(sightflow-vms
     src/RtspSource.cpp
     src/Decoder.cpp
     src/FrameConverter.cpp
+    src/FrameQueue.cpp
+    src/CaptureWorker.cpp
 )
 
 target_include_directories(sightflow-vms PRIVATE ${FFMPEG_INCLUDE_DIRS})

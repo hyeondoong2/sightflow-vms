@@ -1,131 +1,49 @@
+#include <chrono>
 #include <iostream>
-#include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/error.h>
-#include <libavutil/pixdesc.h>
-}
-
-#include "AvError.h"
-#include "Decoder.h"
-#include "FrameConverter.h"
-#include "RtspSource.h"
+#include "CaptureWorker.h"
+#include "FrameQueue.h"
 #include "VideoFrame.h"
-
-namespace {
-
-struct AVPacketDeleter {
-    void operator()(AVPacket* pkt) const noexcept { av_packet_free(&pkt); }
-};
-using PacketPtr = std::unique_ptr<AVPacket, AVPacketDeleter>;
-
-struct AVFrameDeleter {
-    void operator()(AVFrame* frame) const noexcept { av_frame_free(&frame); }
-};
-using FramePtr = std::unique_ptr<AVFrame, AVFrameDeleter>;
-
-} // namespace
 
 int main()
 {
     const std::string url = "rtsp://127.0.0.1:8554/test";
 
-    std::string sourceError;
-    std::unique_ptr<RtspSource> source = RtspSource::open(url, sourceError);
-    if (!source) {
-        std::cerr << sourceError << std::endl;
-        return 1;
-    }
+    FrameQueue queue;
+    CaptureWorker worker(url, queue);
+    worker.start();
 
-    const int videoStreamIndex = source->videoStreamIndex();
-    std::cout << "Connected to " << url << ", video stream index " << videoStreamIndex << std::endl;
+    // --- TEMPORARY console verification only ---
+    // This polling loop stands in for the eventual Qt UI's fixed-interval
+    // QTimer polling FrameQueue::tryPopLatest() (docs/ARCHITECTURE.md §3/§5).
+    // It is not part of the CaptureWorker/FrameQueue design itself -- it
+    // exists only so this console harness can observe frames and then
+    // exercise an explicit stop request. CaptureWorker's own read loop does
+    // NOT stop after any fixed frame count; only stop()/the destructor ends it.
+    constexpr int maxFramesToShow = 30;
+    constexpr auto pollInterval = std::chrono::milliseconds(50);
+    constexpr int maxPolls = 100; // ~5s safety bound if the stream never produces a frame
 
-    std::string decoderError;
-    std::unique_ptr<Decoder> decoder = Decoder::create(source->videoCodecParameters(), decoderError);
-    if (!decoder) {
-        std::cerr << "Failed to create decoder: " << decoderError << std::endl;
-        return 1;
-    }
-
-    PacketPtr packet(av_packet_alloc());
-    if (!packet) {
-        std::cerr << "Failed to allocate AVPacket" << std::endl;
-        return 1;
-    }
-
-    FramePtr frame(av_frame_alloc());
-    if (!frame) {
-        std::cerr << "Failed to allocate AVFrame" << std::endl;
-        return 1;
-    }
-
-    FrameConverter converter;
-
-    constexpr int targetFrames = 30;
-    int convertedFrameCount = 0;
-    bool fatalError = false;
-
-    while (convertedFrameCount < targetFrames && !fatalError) {
-        int ret = source->readPacket(packet.get());
-        if (ret < 0) {
-            std::cerr << "Stream ended or read error: " << avErrorToString(ret) << std::endl;
-            break;
-        }
-
-        if (packet->stream_index != videoStreamIndex) {
-            av_packet_unref(packet.get());
-            continue;
-        }
-
-        ret = decoder->sendPacket(packet.get());
-        av_packet_unref(packet.get()); // packet's data is copied into the decoder; released every code path
-
-        if (ret < 0) {
-            std::cerr << "avcodec_send_packet failed: " << avErrorToString(ret) << std::endl;
-            break;
-        }
-
-        // Drain every frame this packet made available (0, 1, or more).
-        while (convertedFrameCount < targetFrames) {
-            ret = decoder->receiveFrame(frame.get());
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                break; // needs another packet, or stream ended
-            }
-            if (ret < 0) {
-                std::cerr << "avcodec_receive_frame failed: " << avErrorToString(ret) << std::endl;
-                fatalError = true;
-                break;
-            }
-
-            std::string convertError;
-            std::optional<VideoFrame> videoFrame = converter.convert(frame.get(), convertError);
-
-            av_frame_unref(frame.get()); // must be clean before the next receiveFrame call;
-                                          // AVFrame is no longer needed once converted
-
-            if (!videoFrame) {
-                std::cerr << "Failed to convert frame: " << convertError << std::endl;
-                fatalError = true;
-                break;
-            }
-
-            ++convertedFrameCount;
-            std::cout << "frame " << convertedFrameCount << "/" << targetFrames
-                      << " " << videoFrame->width() << "x" << videoFrame->height()
+    int shownFrames = 0;
+    for (int poll = 0; poll < maxPolls && shownFrames < maxFramesToShow; ++poll) {
+        std::optional<VideoFrame> frame = queue.tryPopLatest();
+        if (frame) {
+            ++shownFrames;
+            std::cout << "frame " << shownFrames << " " << frame->width() << "x" << frame->height()
                       << " fmt=BGRA32"
-                      << " stride=" << videoFrame->strideBytes() << "B"
-                      << " bufferSize=" << videoFrame->bufferSize() << "B"
+                      << " stride=" << frame->strideBytes() << "B"
+                      << " bufferSize=" << frame->bufferSize() << "B"
                       << std::endl;
         }
-
-        if (fatalError) {
-            break;
-        }
+        std::this_thread::sleep_for(pollInterval);
     }
 
-    std::cout << "Finished: converted " << convertedFrameCount << " video frames." << std::endl;
+    std::cout << "Requesting stop..." << std::endl;
+    worker.stop();
+    std::cout << "Worker stopped, exiting. Shown " << shownFrames << " frame(s)." << std::endl;
 
-    return (convertedFrameCount == targetFrames) ? 0 : 1;
+    return 0;
 }
