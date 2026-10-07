@@ -26,8 +26,9 @@ Phase 1 (implementation) has not started.
   `docs/ARCHITECTURE.md`. One stream, one capture/decode thread, one Qt UI
   thread, bounded frame queue, basic connect/stop/error states. No
   multi-channel, OpenCV, SQLite, REST/WebSocket, or MCP — except
-  `sightflow-server.exe`'s single MediaMTX-status endpoint, added at the
-  user's explicit direction; see D14 in `docs/DECISIONS.md`.
+  `sightflow-server.exe`'s single MediaMTX-status endpoint (D14), and the
+  client displaying exactly two fixed channels, "test"/"test2" (D20), both
+  added at the user's explicit direction; see `docs/DECISIONS.md`.
 - **Step 0 (environment setup):** Exact toolchain versions (MSVC, CMake, Qt,
   FFmpeg) are **TBD** — not fixed by this documentation. They are to be
   selected and verified at the start of Phase 1 implementation, before any
@@ -52,6 +53,11 @@ Phase 1 (implementation) has not started.
 
 - **Goal:** Extend the proven single-stream pipeline to multiple concurrent
   channels displayed together.
+- **Note:** D20 (`docs/DECISIONS.md`) already displays two hardcoded
+  channels via literal per-channel duplication, as a narrow Phase 1
+  exception — not a Phase 2 implementation. Whether this phase generalizes
+  that shape (and at what channel count it stops scaling) is still an open
+  question for when this phase actually begins, not decided by D20.
 - **Scope:** To be written as a `docs/REQUIREMENTS.md` update when this phase
   begins. Expected to revisit thread-per-stream vs. shared-thread design,
   and layout/UI for multiple channels — decided with the benefit of what

@@ -815,3 +815,79 @@ bounded by, not independent of, the same correctness fix D17 required).
 a client that never retries; updated alongside this entry to describe the
 retry loop, the two-part stale-frame fix, and the shutdown sequence's
 interaction with the retry-backoff wait.
+
+---
+
+## D20 — `sightflow-vms.exe` displays exactly two fixed channels ("test", "test2"); each gets its own independent `FrameQueue`/`CaptureState`/`CaptureWorker`, instantiated by literal duplication, not a channel manager
+
+**Decision:** `main.cpp` now constructs two complete, independent
+single-channel object sets — `FrameQueue`/`CaptureState`/`CaptureWorker` for
+`rtsp://127.0.0.1:8554/test`, and the same three types again for
+`rtsp://127.0.0.1:8554/test2` — by literally writing the construction code
+twice, not through a loop, array, registry, or any new "channel manager"
+type. No class changed: `CaptureWorker`, `CaptureState`, `FrameQueue`, and
+`VideoDisplayItem` were already parameterized per-instance (a URL, and
+references to one queue/state pair) from the single-channel step, so this
+step's entire implementation is two extra local-variable sets in `main.cpp`
+plus a second `VideoDisplayItem` in `src/qml/Main.qml` (found by a second,
+distinct `objectName` and wired the same way the first already was). The two
+channels share no object: channel "test"'s worker thread never touches
+"test2"'s queue, state, or display item, and vice versa — a connection
+failure, retry, or frame drop on one is invisible to the other by
+construction, not by any added guard.
+
+`src/qml/Main.qml` splits the window into two equal-width panes (a `Row` of
+two `Item`s, each `width: parent.width / 2`) — proportional, not
+fixed-pixel, so a window resize keeps the 50/50 split; each pane's
+`VideoDisplayItem` independently preserves its own frame's aspect ratio
+within its own pane via `paint()`'s existing `KeepAspectRatio` logic
+(unchanged — this already worked per-instance, nothing new was needed for
+it). Each pane is labeled with its channel name and shows its *own*
+`CaptureState`-derived connection text (D19), not the other pane's. The
+existing server-status strip (`ServerStatusModel`, D18) is unchanged in
+behavior but its text now explicitly says "[서버 상태 - test 채널 전용]" —
+`sightflow-server.exe` in this step still only runs one `DecodeWorker`, for
+"test" (D16/D17 unchanged, not extended to "test2" here), so that strip
+must not be misread as describing "test2".
+
+**Explicitly out of scope for Phase 1, with a deliberate, narrow exception
+— same pattern as D14.** `docs/REQUIREMENTS.md` ("Explicitly out of scope
+for Phase 1") names "Multiple simultaneous channels/streams" and
+`docs/ROADMAP.md` names Phase 2 as "Multi-channel" specifically. This entry
+is that exception, made at the user's explicit direction, scoped as
+narrowly as D14's: exactly two hardcoded channel names and URLs, no
+channel-list data model, no dynamic add/remove UI, no generic N-channel
+infrastructure. It does not pull forward any other part of Phase 2's scope
+(still no OpenCV, no per-channel settings, no layout beyond a fixed 50/50
+split).
+
+**Reason:** Requested directly by the user as the next incremental step,
+with explicit constraints mirroring the project's established "don't
+over-engineer" rule applied to multi-channel specifically: each channel
+independently owned and unaffected by the other; reuse the existing
+single-channel classes unchanged; no `shared_ptr`, no general-purpose
+channel manager, no dynamic channel UI, no thread pool; extend the existing
+single-channel code with as small a change as possible.
+
+**Alternatives considered:** A `std::vector<ChannelContext>` (or similar)
+holding N channels, iterated in a loop, with channel definitions in a data
+table — rejected as exactly the "general-purpose channel manager" the user
+asked not to build, and as unnecessary for a scope fixed at exactly two
+channels; revisit only if/when Phase 2 actually begins and a real channel
+count/list requirement is scoped. A `QML_ELEMENT` "channel bundle" to pair
+each `VideoDisplayItem` with its own internal `CaptureWorker` — rejected:
+`CaptureWorker` must stay off the Qt/QML side entirely (it is not a
+`QObject` and should not become one just to live in QML), so ownership of
+the worker/queue/state triplet must stay in `main.cpp`, matching the
+existing single-channel shape.
+
+**Trade-offs:** `main.cpp` now has two near-identical six-line blocks
+instead of one — accepted as the honest cost of "exactly two, hardcoded,
+not a loop"; revisit if a third fixed channel is ever requested (at which
+point a small helper may become worth it, but that is a decision for that
+moment, not now). The server status strip still only reports "test" — a
+viewer could still misread "test2"'s true server-side decode state as
+unknown/unavailable rather than "not tracked by the server in this step",
+even with the clarifying label; a full fix (a second `DecodeWorker`/
+`/channels/test2/metrics` on the server) is out of scope here and was not
+requested.

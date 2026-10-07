@@ -42,7 +42,12 @@ its implementation begins.
 
 Do not design or implement any of the following as part of Phase 1, even partially or "for later":
 
-- Multiple simultaneous channels/streams.
+- Multiple simultaneous channels/streams. **Exception:** `sightflow-vms.exe`
+  displays exactly two hardcoded channels ("test", "test2") at the user's
+  explicit direction ahead of this phase boundary — see D20 in
+  `docs/DECISIONS.md`. No channel-list data model, dynamic add/remove UI, or
+  general N-channel infrastructure was added; this does not widen the
+  exclusion beyond those two fixed channels.
 - OpenCV or any motion/image-analysis processing.
 - SQLite or any persistence of events/metadata.
 - REST or WebSocket APIs. **Exception:** `sightflow-server.exe`
