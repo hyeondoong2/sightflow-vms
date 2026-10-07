@@ -25,7 +25,9 @@ Phase 1 (implementation) has not started.
 - **Scope:** As defined in `docs/REQUIREMENTS.md` (Phase 1 requirements) and
   `docs/ARCHITECTURE.md`. One stream, one capture/decode thread, one Qt UI
   thread, bounded frame queue, basic connect/stop/error states. No
-  multi-channel, OpenCV, SQLite, REST/WebSocket, or MCP.
+  multi-channel, OpenCV, SQLite, REST/WebSocket, or MCP — except
+  `sightflow-server.exe`'s single MediaMTX-status endpoint, added at the
+  user's explicit direction; see D14 in `docs/DECISIONS.md`.
 - **Step 0 (environment setup):** Exact toolchain versions (MSVC, CMake, Qt,
   FFmpeg) are **TBD** — not fixed by this documentation. They are to be
   selected and verified at the start of Phase 1 implementation, before any

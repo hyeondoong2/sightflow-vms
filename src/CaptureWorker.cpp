@@ -9,24 +9,11 @@ extern "C" {
 }
 
 #include "AvError.h"
+#include "AvRaii.h"
 #include "Decoder.h"
 #include "FrameConverter.h"
 #include "RtspSource.h"
 #include "VideoFrame.h"
-
-namespace {
-
-struct AVPacketDeleter {
-    void operator()(AVPacket* pkt) const noexcept { av_packet_free(&pkt); }
-};
-using PacketPtr = std::unique_ptr<AVPacket, AVPacketDeleter>;
-
-struct AVFrameDeleter {
-    void operator()(AVFrame* frame) const noexcept { av_frame_free(&frame); }
-};
-using FramePtr = std::unique_ptr<AVFrame, AVFrameDeleter>;
-
-} // namespace
 
 CaptureWorker::CaptureWorker(std::string url, FrameQueue& queue)
     : url_(std::move(url))

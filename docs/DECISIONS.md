@@ -396,3 +396,171 @@ defensively setting both keys forever.
 via a temporary throwaway program (deleted after use, not part of the
 shipped build) that printed the linked `rtsp` demuxer's full `AVOption`
 list; see the conversation this decision was made in for that output.
+
+---
+
+## D14 — Separate `sightflow-server.exe`: async MediaMTX status API, deliberately ahead of `docs/ROADMAP.md`'s phase sequencing
+
+**Decision:** A second, independent executable, `sightflow-server.exe`
+(Qt `Core`+`Network` only — no `Qml`/`Quick`, no FFmpeg), is added alongside
+the unchanged `sightflow-vms.exe`. It exposes `GET /channels/<name>`, which
+asynchronously queries MediaMTX's Control API
+(`GET /v3/paths/get/<name>`, `api: true` in `MediaMTX/mediamtx.yml`) and
+reports whether that path currently has a connected source (`ready`).
+Internals are split into two cooperating classes, mirroring (as class-level
+separation only, not thread-level) a network-I/O-vs-state-management split:
+`HttpServer`/`ClientConnection` (raw HTTP I/O, knows nothing about MediaMTX)
+and `MediaMtxClient`/`ChannelStatusService` (the MediaMTX query and its JSON
+shaping, knows nothing about sockets). Everything runs on one thread/one Qt
+event loop — no worker-thread pool, no MPSC queue, no separate state-
+management thread — because a single channel's query volume doesn't justify
+them. The response distinguishes "confirmed not live" (`200`,
+`"live": false`) from "could not check" (`503`,
+`"error": "mediamtx_unreachable"`) so a caller can never mistake a
+MediaMTX outage for a confirmed-empty path; this status is explicitly the
+*video source's* state (as MediaMTX sees it), never conflated with whether
+`sightflow-vms.exe` itself successfully decoded anything — the two processes
+share no state and never communicate.
+
+**Reason:** Requested directly by the user, independent of
+`docs/ROADMAP.md`'s phase sequence. `docs/REQUIREMENTS.md` ("Explicitly out
+of scope for Phase 1") and `CLAUDE.md` ("Do not pull forward work from later
+phases... REST/WebSocket... unless the current roadmap phase explicitly
+calls for it") both name REST APIs as out of scope for Phase 1 specifically
+— this decision is a deliberate, acknowledged exception made at the user's
+explicit direction, not a reinterpretation of that scope boundary. It is
+scoped as narrowly as the request: one read-only endpoint, one channel name
+passed through verbatim, no config/auth/multi-channel-listing, no change to
+`sightflow-vms.exe`.
+
+**Alternatives considered:** Folding this into `sightflow-vms.exe` itself
+(rejected — the user asked for a separate process, and it keeps the Qt/QML
+display app's process free of a listening network port). Building it on
+Qt HttpServer (rejected only because that module isn't installed in this
+project's Qt kit — see D15's sibling note below; `QTcpServer` + minimal
+hand-rolled HTTP/1.1 GET parsing was used instead, still fully event-loop-
+driven). An actual IOCP-style worker-thread-pool + MPSC-queue design
+(explicitly rejected by the user as over-engineered for one channel's query
+volume).
+
+**Trade-offs:** `docs/ROADMAP.md` and `docs/REQUIREMENTS.md` now describe a
+Phase 1 scope that is narrower than what actually exists in `src/server/`.
+Not reconciled by rewriting those documents now (out of scope for this
+decision) — a reader should treat this entry, not the phase-1-only wording
+elsewhere, as authoritative for `src/server/`'s existence and scope until
+those documents are explicitly updated.
+
+---
+
+## D15 — `HttpServer`/`ClientConnection` teardown uses `deleteLater()`, never a direct `delete`, from within connection-finished handling
+
+**Decision:** When a `ClientConnection` finishes (its socket disconnects, or
+`HttpServer::shutdown()` tears it down), it is removed from `HttpServer`'s
+tracking list and always destroyed via `QObject::deleteLater()` — never a
+synchronous `delete` (and never implicitly via a `std::unique_ptr` erased
+from within a slot). `HttpServer::shutdown()` additionally calls
+`ClientConnection::abortConnection()` first, which synchronously aborts the
+underlying `QTcpSocket` (releasing the OS socket handle immediately) without
+destroying the C++ object, and snapshots+clears its connection list before
+touching any connection, so a synchronous `abort()` → `disconnected` →
+`finished` re-entry cannot mutate the list mid-iteration.
+
+**Reason:** The first implementation called `delete` (via
+`std::vector<std::unique_ptr<ClientConnection>>::erase`) directly from
+`HttpServer::onConnectionFinished`, itself invoked synchronously from
+`ClientConnection::onDisconnected` — a slot connected to that same
+`ClientConnection`'s owned `QTcpSocket`'s `disconnected` signal. That deletes
+the `QTcpSocket` (a child of the `ClientConnection` being deleted) while it
+is still unwinding its own `disconnected` signal emission — deleting a
+`QObject` from within its own signal's call stack is undefined behavior.
+This was caught empirically: a manual test firing several concurrent
+`GET /channels/test` requests (each connection closing immediately after its
+response, per `Connection: close`) reliably crashed the process with a
+segmentation fault, where a single sequential request had not (narrow
+timing window, not a guaranteed-every-time crash — exactly the kind of bug
+that is easy to miss without concurrent testing). `deleteLater()` defers the
+actual destruction to the next event-loop iteration, after the signal
+emission that triggered it has fully returned, which is the standard safe
+pattern for this.
+
+**Alternatives considered:** Keeping immediate `delete` but only ever
+triggering it from a freshly-queued event (e.g. `QTimer::singleShot(0, ...)`)
+— rejected as reinventing what `deleteLater()` already does. Not aborting the
+socket synchronously during `shutdown()` and relying solely on `deleteLater()`
+— rejected because the OS socket handle would only be released once the
+deferred delete actually runs, which is not guaranteed to happen before
+`QCoreApplication::exec()` returns from `aboutToQuit`.
+
+**Trade-offs:** None identified — `deleteLater()` costs one extra event-loop
+round-trip before a finished connection's memory is actually freed, which is
+irrelevant at this request volume.
+
+---
+
+## D16 — `sightflow-server.exe` decodes one RTSP channel on a dedicated thread (`DecodeWorker`); only a small mutex-guarded `DecodeMetrics` struct crosses into the Qt event-loop thread
+
+**Decision:** `sightflow-server.exe` gains a second, independent piece of
+state beyond the MediaMTX status query (D14): `DecodeWorker`, a dedicated
+`std::thread` that opens the `test` channel's RTSP URL and runs the same
+demux→decode loop shape as `CaptureWorker` (src/CaptureWorker.cpp), reusing
+`RtspSource` and `Decoder` directly (both compiled into the `sightflow-server`
+target from their existing `src/` sources — not duplicated). No pixel
+conversion (`FrameConverter`), no `FrameQueue`, no display: after each
+`avcodec_receive_frame` success, only `frame->width`/`frame->height` are read
+and the `AVFrame` is unref'd immediately. The *only* thing this thread writes
+is `DecodeMetrics` — a plain, Qt-free, mutex-guarded struct (framesDecoded
+count, last frame's width/height, a `{Connecting, Running, Error, Stopped}`
+state, last error message). The Qt event-loop thread reads it via
+`DecodeMetrics::snapshot()` (lock held only for the copy, same discipline as
+`FrameQueue`) when answering `GET /channels/<name>/metrics`
+(`DecodeMetricsService`, a sibling of `ChannelStatusService` that knows
+nothing about MediaMTX). No `AVPacket`, `AVFrame`, or Qt socket object ever
+crosses the worker-thread/event-loop-thread boundary — exactly mirroring
+D9's "no FFmpeg type crosses the boundary" rule, just with a metrics struct
+in place of `VideoFrame`.
+
+The new endpoint's `"source": "decoder"` field is deliberately a different
+string from the existing `GET /channels/<name>`'s `"source": "mediamtx"`
+(D14) — one reports what MediaMTX sees from the camera side, the other
+reports what this process's own decoder actually did; a reader must not
+conflate them. Unlike D14's endpoint, this one never returns `503`: there is
+no external dependency to be "unreachable" — reading `DecodeMetrics` always
+succeeds, and `state` carries whatever actually happened (including
+`"error"`).
+
+**Reason:** Requested directly by the user as the next incremental step
+after D14/D15, with explicit constraints: reuse `RtspSource`/`Decoder`
+rather than duplicating decode logic; never call a blocking FFmpeg function
+from the HTTP-handling thread; pass only small app-owned state across the
+worker boundary (no `AVPacket`/`AVFrame`/socket objects); no thread pool, no
+IOCP, no MPSC queue, no multi-channel, no motion detection. A dedicated
+thread is required here for the same reason `CaptureWorker` needs one (D-level
+reasoning in `docs/ARCHITECTURE.md` §3): FFmpeg's blocking C calls have no
+Qt/event-loop integration, so the only way to keep the HTTP server's event
+loop responsive is a real OS thread, with shutdown built on the same
+`AVIOInterruptCB` mechanism (§7) `RtspSource` already provides — no new
+cancellation mechanism was invented.
+
+**Alternatives considered:** Running the decode loop on the Qt event-loop
+thread itself (rejected outright — it would block every HTTP response for as
+long as a blocking FFmpeg call takes, violating the user's explicit
+constraint). An IOCP-style worker pool feeding an MPSC queue into a single
+"logic thread" that owns all server state (the user's own prior-project
+shape, explicitly rejected for this step as over-engineered: with exactly
+one producer (`DecodeWorker`) and one piece of state, a single mutex-guarded
+struct gives the same "exactly one thread touches live frame-producing
+state at a time" property an MPSC queue would, without a queue). A Qt
+queued signal carrying the metrics struct per decoded frame (rejected for
+the same reason as D7: an unbounded implicit queue in Qt's own event
+delivery, now for metrics instead of frame data, for no benefit over a plain
+mutex since the data is tiny and polled, not streamed).
+
+**Trade-offs:** A request to `GET /channels/<name>/metrics` can observe a
+`DecodeMetrics` snapshot that is marginally stale (up to one frame interval
+behind) relative to the decode thread's true current state — acceptable, this
+is a polled metrics endpoint, not a live stream. `DecodeWorker::stop()` is
+called synchronously from the Qt thread during shutdown (`aboutToQuit`) and
+blocks it for up to one `AVIOInterruptCB` poll interval (or the RTSP network
+timeout in the worst case) — the same bounded, accepted shutdown latency
+documented for `CaptureWorker` in `docs/ARCHITECTURE.md` §7/D8, now paid once
+more on the server side.

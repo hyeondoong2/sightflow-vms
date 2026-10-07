@@ -45,7 +45,11 @@ Do not design or implement any of the following as part of Phase 1, even partial
 - Multiple simultaneous channels/streams.
 - OpenCV or any motion/image-analysis processing.
 - SQLite or any persistence of events/metadata.
-- REST or WebSocket APIs.
+- REST or WebSocket APIs. **Exception:** `sightflow-server.exe`
+  (`GET /channels/<name>`, a MediaMTX status query) was added at the user's
+  explicit direction ahead of this phase boundary — see D14 in
+  `docs/DECISIONS.md`. It does not widen this exclusion for anything else;
+  no other REST/WebSocket surface is in scope.
 - MCP integration.
 - Recording/export of video to disk.
 - Authentication, user accounts, multi-user access.
