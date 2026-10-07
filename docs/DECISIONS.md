@@ -643,3 +643,77 @@ the following `Connecting` attempt before being cleared by the next
 is broken right now" rather than "this is what went wrong most recently"
 will misread it; `state` is the field that must be read for current
 liveness, `error` is context, not an alarm by itself.
+
+---
+
+## D18 — `sightflow-vms.exe` gets a self-contained `ServerStatusModel` (QML_ELEMENT) that polls both server endpoints over Qt's async network API; no coupling to the video path
+
+**Decision:** The client gains `ServerStatusModel` (`src/ServerStatusModel.h`/
+`.cpp`), a plain `QObject` with `QML_ELEMENT` (same pattern as
+`VideoDisplayItem`) that owns its own `QNetworkAccessManager` and a
+`QTimer` (2000ms). On every tick it issues at most one outstanding `GET`
+each to `http://127.0.0.1:8080/channels/test` and `.../metrics` — a
+non-owning `QNetworkReply*` guard per endpoint (`channelStatusReply_`/
+`decodeMetricsReply_`, cleared to `nullptr` as the first action inside that
+reply's own `finished` handler, before anything else runs) makes `poll()`
+skip issuing a new request for an endpoint whose previous one hasn't
+finished yet, so requests never queue up. Each `QNetworkRequest` sets
+`setTransferTimeout(2000)` so a hung connection is eventually recovered
+without an unconditional wait. `ServerStatusModel` is fully self-contained —
+unlike `VideoDisplayItem`, which needs a C++-constructed `FrameQueue*`
+handed to it since QML can't build one, `ServerStatusModel`'s dependencies
+(server base URL, channel name) are simple hardcoded constants, so it is
+declared directly in `src/qml/Main.qml` with no `main.cpp` wiring at all.
+
+Every property is exposed as an explicit (value, reachable) pair —
+`mediaMtxLive`/`mediaMtxReachable`/`channelStatusReachable` for `GET
+/channels/test`, `decodeState`/`framesDecoded`/`decodeMetricsReachable` for
+`GET /channels/test/metrics` — because a request that fails outright
+(`sightflow-server.exe` not running, timeout, malformed JSON) must not leave
+the previous successful value on screen looking current. Each `finished`
+handler mirrors `MediaMtxClient`'s own reachability check (D14): an HTTP
+status-code attribute being present means `sightflow-server.exe` answered
+at all (its `GET /channels/test` 503 for "MediaMTX unreachable" still counts
+as a reachable, successfully-parsed answer from the *server*); its absence,
+or a JSON parse failure, means the *Reachable flag goes false and the paired
+value resets to a default, not whatever it was before. QML
+(`src/qml/Main.qml`) reads these flags and renders "서버 연결 안 됨" /
+"MediaMTX 응답 없음" instead of a stale value when the corresponding
+*Reachable is false. The status strip's text is explicit that `framesDecoded`
+is "서버 측 디코딩" (the server's own `DecodeWorker`'s count, D16/D17) and
+that "MediaMTX 송출" (`mediaMtxLive`) is a separate signal from it — the two
+must never be read as the same thing, let alone as "frames this window has
+displayed."
+
+`ServerStatusModel` shares no object, thread, or queue with the existing
+video path (`RtspSource` → `CaptureWorker` → `FrameQueue` →
+`VideoDisplayItem`, `docs/ARCHITECTURE.md` §1–5): it does not touch
+`FrameQueue`, is never read from or written to by `CaptureWorker`'s thread,
+and `sightflow-server.exe` being down affects only its own four properties
+going to their unreachable defaults — the RTSP video continues completely
+unaffected, since nothing in that path ever depended on this class existing.
+
+**Reason:** Requested directly by the user: a small on-screen indicator of
+MediaMTX's publish state and the server's own decode state/frame count,
+using Qt's async network API (never blocking the UI thread), without
+stacking up duplicate requests, without adding a per-frame network call, a
+second decode thread, WebSockets, multi-channel UI, or a general-purpose
+networking framework.
+
+**Alternatives considered:** A context property wired up in `main.cpp`
+(`engine.rootContext()->setContextProperty(...)`), matching how some Qt/QML
+apps expose C++ state — rejected in favor of `QML_ELEMENT` + direct
+declaration in QML, since (unlike `VideoDisplayItem`) this class has no
+C++-only dependency that QML can't construct itself, so the extra
+`main.cpp` wiring would be pure boilerplate. A single combined
+"serverReachable" flag covering both endpoints — rejected: the two HTTP
+requests are independent and can succeed/fail independently within the same
+poll tick (e.g. one endpoint slow, the other fine), so collapsing them would
+hide which one actually failed.
+
+**Trade-offs:** Two independent HTTP round trips every 2s instead of one —
+accepted, since the two endpoints answer different questions (D14 vs D16)
+and combining them would require a new server-side endpoint, out of scope
+here. The status strip can show up to one poll interval (2s) of staleness
+relative to the server's true current state — acceptable for a status
+display, not a control surface.

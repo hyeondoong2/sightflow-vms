@@ -27,11 +27,13 @@ qt_add_qml_module(sightflow-vms
     SOURCES
         src/VideoDisplayItem.h
         src/VideoDisplayItem.cpp
+        src/ServerStatusModel.h
+        src/ServerStatusModel.cpp
 )
 
 target_include_directories(sightflow-vms PRIVATE ${FFMPEG_INCLUDE_DIRS} src)
 target_link_directories(sightflow-vms PRIVATE ${FFMPEG_LIBRARY_DIRS})
-target_link_libraries(sightflow-vms PRIVATE ${FFMPEG_LIBRARIES} Qt6::Quick)
+target_link_libraries(sightflow-vms PRIVATE ${FFMPEG_LIBRARIES} Qt6::Quick Qt6::Network)
 
 # Qt (unlike vcpkg's FFmpeg) does not auto-copy its runtime DLLs/plugins next
 # to the executable, so the app can't start without this: no Qt platform
