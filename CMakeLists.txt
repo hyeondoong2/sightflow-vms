@@ -24,9 +24,12 @@ qt_add_qml_module(sightflow-vms
     VERSION 1.0
     QML_FILES
         src/qml/Main.qml
+    SOURCES
+        src/VideoDisplayItem.h
+        src/VideoDisplayItem.cpp
 )
 
-target_include_directories(sightflow-vms PRIVATE ${FFMPEG_INCLUDE_DIRS})
+target_include_directories(sightflow-vms PRIVATE ${FFMPEG_INCLUDE_DIRS} src)
 target_link_directories(sightflow-vms PRIVATE ${FFMPEG_LIBRARY_DIRS})
 target_link_libraries(sightflow-vms PRIVATE ${FFMPEG_LIBRARIES} Qt6::Quick)
 
