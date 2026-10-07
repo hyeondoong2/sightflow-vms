@@ -1,6 +1,7 @@
 #include "DecodeWorker.h"
 
 #include <iostream>
+#include <sstream>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -65,8 +66,20 @@ bool DecodeWorker::retryAfterFailure(const std::string& message, int& consecutiv
     // a dead source can otherwise fill the console with an identical line
     // every kRetryIntervalMs forever.
     if (consecutiveFailures == 1 || consecutiveFailures % kLogEveryNFailures == 0) {
-        std::cerr << "DecodeWorker: attempt " << consecutiveFailures << " failed (" << message
-                   << "), retrying in " << (kRetryIntervalMs / 1000) << "s" << std::endl;
+        // Built into one string and written with a single `<<` call: with
+        // two DecodeWorkers (one per fixed channel, D21) logging from two
+        // different threads, a chained `std::cerr << a << b << c` here was
+        // observed to interleave character-by-character with the other
+        // worker's chained output onto the same stream -- a single write
+        // keeps one worker's line intact regardless of what the other
+        // worker logs at the same moment. `url_` is included so a reader
+        // can tell which channel a line belongs to even for error messages
+        // that don't otherwise mention it (unlike the "failed to open"
+        // message, which already embeds the URL itself).
+        std::ostringstream line;
+        line << "DecodeWorker[" << url_ << "]: attempt " << consecutiveFailures << " failed (" << message
+             << "), retrying in " << (kRetryIntervalMs / 1000) << "s\n";
+        std::cerr << line.str();
     }
 
     return waitBeforeRetry();

@@ -891,3 +891,100 @@ unknown/unavailable rather than "not tracked by the server in this step",
 even with the clarifying label; a full fix (a second `DecodeWorker`/
 `/channels/test2/metrics` on the server) is out of scope here and was not
 requested.
+
+---
+
+## D21 — `sightflow-server.exe` and `ServerStatusModel` extended to both fixed channels; fulfills the gap D20 explicitly left open
+
+**Decision:** This closes exactly the gap D20's Trade-offs section named:
+`sightflow-server.exe` now runs two independent `DecodeWorker` instances —
+one per fixed channel, `test` and `test2` — each with its own
+`DecodeMetrics` and `DecodeMetricsService`, constructed by literal
+duplication in `main.cpp` (mirroring D20's client-side pattern exactly, not
+a new mechanism). `GET /channels/test/metrics` and
+`GET /channels/test2/metrics` are both live, same JSON shape and contract
+as before (D16/D17) — nothing about the response format changed, only that
+a second, fully independent instance of the whole chain now answers for
+`test2`. `ChannelStatusService` (D14) needed **no change at all**: it was
+already channel-name-generic — it forwards whatever name is in the request
+path straight through to `MediaMtxClient::queryPathStatus()` — so
+`GET /channels/test2` already worked before this entry, and still does, via
+the same single `ChannelStatusService` instance serving both channels.
+
+Routing in `main.cpp` is exact-string matching on the two known metrics
+paths (`"/channels/test/metrics"`, `"/channels/test2/metrics"`), not a
+generic "strip the suffix and look up a channel registry" dispatcher —
+anything else ending in `/metrics` is a plain 404. This is deliberately not
+infrastructure for an arbitrary channel count; see Alternatives below.
+
+Shutdown now stops both `DecodeWorker`s from the single `aboutToQuit`
+handler, sequentially (`decodeWorkerTest.stop()` then
+`decodeWorkerTest2.stop()`) — each call is already bounded (one
+interrupt-callback poll, or an immediate `condition_variable` wake if
+between retry attempts, D17) and two fixed channels don't justify added
+complexity to overlap the two joins.
+
+On the client, `ServerStatusModel` (D18) gains a settable `channelName`
+property (default `"test"`, for source compatibility with existing
+single-instance behavior) instead of a hardcoded channel name, so
+`src/qml/Main.qml` can declare one instance per pane
+(`ServerStatusModel { channelName: "test2" }`). Its first poll moved from a
+synchronous constructor call to `QTimer::singleShot(0, ...)`: QML assigns
+declared properties (including `channelName`) immediately after
+construction but *before* control returns to the event loop, so a
+same-tick synchronous poll in the constructor would have queried whatever
+`channelName_`'s compiled-in default was, never the value QML actually
+declared. The previous single, window-wide "[서버 상태 - test 채널 전용]"
+strip is replaced by one such status line per pane, each clearly showing
+its own channel name and reporting only that channel's MediaMTX/decode
+state — not the other pane's, and still clearly distinguished from that
+pane's own `VideoDisplayItem.connectionState` text (D19/D20, the client's
+own RTSP connection, unrelated to anything in this entry).
+
+**Reason:** Requested directly by the user as the natural next step after
+D20 — D20's own Trade-offs section already named this exact gap
+("test2"'s server-side decode state unknown/unavailable) and said a fix was
+out of scope *then*; it is in scope now. Constraints mirrored D20's:
+independent per-channel ownership (a failure/retry/shutdown on one
+`DecodeWorker` must not touch the other's thread, metrics, or HTTP
+response), no change to the existing response contracts, no general channel
+registration system, FFmpeg decoding confined to each worker thread with
+`AVPacket`/`AVFrame` never reaching the Qt HTTP thread (already true by
+construction -- `DecodeMetrics` is the only thing that crosses that
+boundary, unchanged from D16), and no stale "last known good" state shown
+when the server or MediaMTX is down (already true by construction -- the
+*Reachable flags, unchanged from D18, already force that).
+
+**Alternatives considered:** A `QMap<QString, DecodeWorker*>` (or similar)
+keyed by channel name, with a generic metrics-route handler doing a map
+lookup — rejected for the same reason D20 rejected a
+`std::vector<ChannelContext>`: it is exactly the "범용 채널 등록 시스템"
+the user asked not to build, for a scope fixed at exactly two channels.
+Giving `ServerStatusModel` a constructor parameter for `channelName`
+instead of a settable `Q_PROPERTY` — rejected: `QML_ELEMENT` types are
+constructed by QML with their default constructor and then have declared
+properties assigned, so a required constructor argument isn't available to
+set from QML at all; a property is the only way QML can parameterize an
+instance it creates declaratively.
+
+**Trade-offs:** None identified beyond what D16/D17/D18/D20 already
+accepted for this same shape applied once; this entry is that shape applied
+twice, independently, with no new kind of risk introduced. Shutdown time
+for `sightflow-server.exe` is now the sum of two (already small, bounded)
+`DecodeWorker::stop()` calls instead of one — not parallelized, accepted as
+not worth the added complexity for two fixed channels (see Decision above).
+
+**Bug found and fixed while testing this entry:** `DecodeWorker`'s
+rate-limited failure log used a chained `std::cerr << a << b << c << ...`.
+With two `DecodeWorker`s actually running concurrently for the first time
+(one per channel), their chained output was observed to interleave
+character-by-character on the shared stream when both logged at the same
+moment (e.g. both failing to connect at startup before either stream was
+published) -- each `<<` call is a separate, independently-ordered write
+against the other thread's. Fixed by building the full line into one
+`std::string` first and writing it with a single `std::cerr <<` call, and
+by adding `url_` to the line so a reader can tell which channel it belongs
+to even for error messages that don't otherwise mention it. Only the log
+output was affected -- `DecodeMetrics` (the data each endpoint actually
+reports) was never at risk, since it was already mutex-protected
+per-instance (D16).

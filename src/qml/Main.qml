@@ -8,57 +8,13 @@ Window {
     visible: true
     title: "SightFlow VMS"
 
-    // Server status strip: polls sightflow-server.exe over HTTP
-    // (ServerStatusModel, docs/DECISIONS.md D18) -- entirely separate from
-    // both RTSP video panes below. This server only ever runs a DecodeWorker
-    // for the "test" channel (D16/D20), so everything in this strip is
-    // specifically about "test" -- it says nothing about "test2"'s state.
-    ServerStatusModel {
-        id: serverStatus
-    }
-
-    Rectangle {
-        id: topBar
-        anchors.top: parent.top
-        anchors.left: parent.left
-        anchors.right: parent.right
-        height: statusText.implicitHeight + 8
-        color: "#99000000"
-        z: 10
-
-        Text {
-            id: statusText
-            anchors.fill: parent
-            anchors.margins: 4
-            color: "white"
-            font.pixelSize: 12
-            text: {
-                const mediaMtxPart = !serverStatus.channelStatusReachable
-                    ? qsTr("MediaMTX 송출: 서버 연결 안 됨")
-                    : !serverStatus.mediaMtxReachable
-                        ? qsTr("MediaMTX 송출: MediaMTX 응답 없음")
-                        : qsTr("MediaMTX 송출: ") + (serverStatus.mediaMtxLive ? qsTr("있음") : qsTr("없음"))
-
-                const decodePart = !serverStatus.decodeMetricsReachable
-                    ? qsTr("서버 디코딩: 서버 연결 안 됨")
-                    : qsTr("서버 디코딩: ") + serverStatus.decodeState
-                        + qsTr(" (서버 측 디코딩 프레임 ") + serverStatus.framesDecoded + qsTr("개)")
-
-                qsTr("[서버 상태 - test 채널 전용] ") + mediaMtxPart + "  |  " + decodePart
-            }
-        }
-    }
-
     // Two fixed channel panes, side by side, each exactly half the window's
     // width -- proportional (not fixed-pixel), so the split stays 50/50 on
     // resize. Each VideoDisplayItem independently preserves its own frame's
     // aspect ratio within its pane via paint()'s existing KeepAspectRatio
     // logic (unchanged) -- nothing new was needed for that part.
     Row {
-        anchors.top: topBar.bottom
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.bottom: parent.bottom
+        anchors.fill: parent
 
         // Channel "test" pane.
         Item {
@@ -78,18 +34,52 @@ Window {
                 anchors.fill: parent
             }
 
-            Text {
+            // This channel's SERVER-side status, queried over HTTP from
+            // sightflow-server.exe (ServerStatusModel, D21) -- MediaMTX's
+            // publish state and this server's own DecodeWorker state for
+            // "test" specifically. Entirely separate from
+            // videoDisplayTest.connectionState below, which is this
+            // window's own RTSP connection to the camera -- the two must
+            // never be read as the same signal.
+            ServerStatusModel {
+                id: serverStatusTest
+                channelName: "test"
+            }
+
+            Rectangle {
                 anchors.top: parent.top
                 anchors.left: parent.left
-                anchors.margins: 4
-                color: "white"
-                font.pixelSize: 12
-                text: "test"
+                anchors.right: parent.right
+                height: serverStatusTextTest.implicitHeight + 8
+                color: "#99000000"
+
+                Text {
+                    id: serverStatusTextTest
+                    anchors.fill: parent
+                    anchors.margins: 4
+                    color: "white"
+                    font.pixelSize: 11
+                    wrapMode: Text.NoWrap
+                    text: {
+                        const mediaMtxPart = !serverStatusTest.channelStatusReachable
+                            ? qsTr("서버 연결 안 됨")
+                            : !serverStatusTest.mediaMtxReachable
+                                ? qsTr("MediaMTX 응답 없음")
+                                : qsTr("MediaMTX 송출 ") + (serverStatusTest.mediaMtxLive ? qsTr("있음") : qsTr("없음"))
+
+                        const decodePart = !serverStatusTest.decodeMetricsReachable
+                            ? qsTr("서버 디코딩: 연결 안 됨")
+                            : qsTr("서버 디코딩 ") + serverStatusTest.decodeState
+                                + qsTr(" (") + serverStatusTest.framesDecoded + qsTr("프레임)")
+
+                        qsTr("test  |  ") + mediaMtxPart + "  " + decodePart
+                    }
+                }
             }
 
             // This channel's OWN client-side connection state (CaptureWorker,
-            // D19/D20) -- not the server status strip above, and not the
-            // other pane's state.
+            // D19/D20) -- the window's own RTSP connection, not the server
+            // status above and not the other pane's state.
             Text {
                 anchors.centerIn: parent
                 visible: videoDisplayTest.connectionState !== "running"
@@ -103,7 +93,8 @@ Window {
             }
         }
 
-        // Channel "test2" pane -- identical structure, independent state.
+        // Channel "test2" pane -- identical structure, independent
+        // ServerStatusModel and independent CaptureWorker/VideoDisplayItem.
         Item {
             width: parent.width / 2
             height: parent.height
@@ -119,13 +110,40 @@ Window {
                 anchors.fill: parent
             }
 
-            Text {
+            ServerStatusModel {
+                id: serverStatusTest2
+                channelName: "test2"
+            }
+
+            Rectangle {
                 anchors.top: parent.top
                 anchors.left: parent.left
-                anchors.margins: 4
-                color: "white"
-                font.pixelSize: 12
-                text: "test2"
+                anchors.right: parent.right
+                height: serverStatusTextTest2.implicitHeight + 8
+                color: "#99000000"
+
+                Text {
+                    id: serverStatusTextTest2
+                    anchors.fill: parent
+                    anchors.margins: 4
+                    color: "white"
+                    font.pixelSize: 11
+                    wrapMode: Text.NoWrap
+                    text: {
+                        const mediaMtxPart = !serverStatusTest2.channelStatusReachable
+                            ? qsTr("서버 연결 안 됨")
+                            : !serverStatusTest2.mediaMtxReachable
+                                ? qsTr("MediaMTX 응답 없음")
+                                : qsTr("MediaMTX 송출 ") + (serverStatusTest2.mediaMtxLive ? qsTr("있음") : qsTr("없음"))
+
+                        const decodePart = !serverStatusTest2.decodeMetricsReachable
+                            ? qsTr("서버 디코딩: 연결 안 됨")
+                            : qsTr("서버 디코딩 ") + serverStatusTest2.decodeState
+                                + qsTr(" (") + serverStatusTest2.framesDecoded + qsTr("프레임)")
+
+                        qsTr("test2  |  ") + mediaMtxPart + "  " + decodePart
+                    }
+                }
             }
 
             Text {

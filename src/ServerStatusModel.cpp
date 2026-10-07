@@ -8,7 +8,6 @@
 #include <QUrl>
 
 const char* const ServerStatusModel::kServerBaseUrl = "http://127.0.0.1:8080";
-const char* const ServerStatusModel::kChannelName = "test";
 
 ServerStatusModel::ServerStatusModel(QObject* parent)
     : QObject(parent)
@@ -16,7 +15,22 @@ ServerStatusModel::ServerStatusModel(QObject* parent)
 {
     connect(&timer_, &QTimer::timeout, this, &ServerStatusModel::poll);
     timer_.start(kPollIntervalMs);
-    poll(); // first result on screen right away, not after the first interval
+
+    // Deferred, not called synchronously here: QML assigns declared
+    // properties (including channelName) right after construction, before
+    // control returns to the event loop -- a 0ms singleShot runs after
+    // that, so this instance's first poll already uses the channel QML
+    // actually declared, not channelName_'s default.
+    QTimer::singleShot(0, this, &ServerStatusModel::poll);
+}
+
+void ServerStatusModel::setChannelName(const QString& name)
+{
+    if (channelName_ == name) {
+        return;
+    }
+    channelName_ = name;
+    emit channelNameChanged();
 }
 
 void ServerStatusModel::poll()
@@ -31,8 +45,7 @@ void ServerStatusModel::queryChannelStatus()
         return; // previous query still in flight -- never stack up requests
     }
 
-    QNetworkRequest request(QUrl(QString::fromLatin1(kServerBaseUrl) + QStringLiteral("/channels/")
-        + QString::fromLatin1(kChannelName)));
+    QNetworkRequest request(QUrl(QString::fromLatin1(kServerBaseUrl) + QStringLiteral("/channels/") + channelName_));
     request.setTransferTimeout(kRequestTimeoutMs);
 
     channelStatusReply_ = network_->get(request);
@@ -72,8 +85,8 @@ void ServerStatusModel::queryDecodeMetrics()
         return; // previous query still in flight -- never stack up requests
     }
 
-    QNetworkRequest request(QUrl(QString::fromLatin1(kServerBaseUrl) + QStringLiteral("/channels/")
-        + QString::fromLatin1(kChannelName) + QStringLiteral("/metrics")));
+    QNetworkRequest request(
+        QUrl(QString::fromLatin1(kServerBaseUrl) + QStringLiteral("/channels/") + channelName_ + QStringLiteral("/metrics")));
     request.setTransferTimeout(kRequestTimeoutMs);
 
     decodeMetricsReply_ = network_->get(request);

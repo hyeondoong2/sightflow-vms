@@ -9,12 +9,22 @@ class QNetworkAccessManager;
 class QNetworkReply;
 
 // Periodically polls sightflow-server.exe's two read-only status endpoints
-// (GET /channels/test, GET /channels/test/metrics) over Qt's async network
-// API and exposes the results as QML-bindable properties for a small status
-// strip in Main.qml. Fully self-contained (owns its own
-// QNetworkAccessManager and QTimer) -- unlike VideoDisplayItem, nothing
-// needs to be wired in from main.cpp, so it can be declared directly in
-// QML.
+// for one channel -- GET /channels/<channelName>, GET
+// /channels/<channelName>/metrics -- over Qt's async network API and
+// exposes the results as QML-bindable properties. Fully self-contained
+// (owns its own QNetworkAccessManager and QTimer) -- unlike
+// VideoDisplayItem, nothing needs to be wired in from main.cpp, so it can
+// be declared directly in QML.
+//
+// `channelName` is a settable property (default "test") so QML can declare
+// one instance per fixed channel -- e.g. `ServerStatusModel { channelName:
+// "test2" }` -- each polling independently (docs/DECISIONS.md D21). The
+// first poll is deferred to the next event-loop tick (QTimer::singleShot(0,
+// ...)) rather than fired synchronously from the constructor, specifically
+// so it runs *after* QML has finished assigning `channelName` (QML sets
+// declared properties right after construction, before control returns to
+// the event loop) -- firing synchronously in the constructor would poll
+// whatever channelName's default value is, not the one QML declared.
 //
 // This is a read-only STATUS DISPLAY, entirely separate from the existing
 // RTSP video path (RtspSource -> CaptureWorker -> FrameQueue ->
@@ -32,24 +42,34 @@ class ServerStatusModel : public QObject {
     Q_OBJECT
     QML_ELEMENT
 
-    // From GET /channels/test (MediaMTX's own view, via sightflow-server --
-    // see docs/DECISIONS.md D14). mediaMtxLive/mediaMtxReachable are only
-    // meaningful when channelStatusReachable is true.
+    // Which channel this instance polls. Not a general N-channel list --
+    // this project fixes exactly "test"/"test2" (D20/D21); QML simply
+    // declares one ServerStatusModel per fixed channel.
+    Q_PROPERTY(QString channelName READ channelName WRITE setChannelName NOTIFY channelNameChanged)
+
+    // From GET /channels/<channelName> (MediaMTX's own view, via
+    // sightflow-server -- see docs/DECISIONS.md D14). mediaMtxLive/
+    // mediaMtxReachable are only meaningful when channelStatusReachable is
+    // true.
     Q_PROPERTY(bool channelStatusReachable READ channelStatusReachable NOTIFY statusChanged)
     Q_PROPERTY(bool mediaMtxReachable READ mediaMtxReachable NOTIFY statusChanged)
     Q_PROPERTY(bool mediaMtxLive READ mediaMtxLive NOTIFY statusChanged)
 
-    // From GET /channels/test/metrics -- sightflow-server.exe's own
-    // DecodeWorker (D16/D17). decodeState/framesDecoded are only meaningful
-    // when decodeMetricsReachable is true. framesDecoded is the SERVER's
-    // decode worker's count for its current (or most recently ended)
-    // connection -- never frames this client window has displayed.
+    // From GET /channels/<channelName>/metrics -- sightflow-server.exe's
+    // own DecodeWorker for this channel (D16/D17/D21). decodeState/
+    // framesDecoded are only meaningful when decodeMetricsReachable is
+    // true. framesDecoded is the SERVER's decode worker's count for its
+    // current (or most recently ended) connection -- never frames this
+    // client window has displayed.
     Q_PROPERTY(bool decodeMetricsReachable READ decodeMetricsReachable NOTIFY statusChanged)
     Q_PROPERTY(QString decodeState READ decodeState NOTIFY statusChanged)
     Q_PROPERTY(qlonglong framesDecoded READ framesDecoded NOTIFY statusChanged)
 
 public:
     explicit ServerStatusModel(QObject* parent = nullptr);
+
+    QString channelName() const { return channelName_; }
+    void setChannelName(const QString& name);
 
     bool channelStatusReachable() const noexcept { return channelStatusReachable_; }
     bool mediaMtxReachable() const noexcept { return mediaMtxReachable_; }
@@ -60,6 +80,7 @@ public:
     qlonglong framesDecoded() const noexcept { return framesDecoded_; }
 
 signals:
+    void channelNameChanged();
     void statusChanged();
 
 private slots:
@@ -72,7 +93,8 @@ private:
     static constexpr int kPollIntervalMs = 2000;
     static constexpr int kRequestTimeoutMs = 2000;
     static const char* const kServerBaseUrl;
-    static const char* const kChannelName;
+
+    QString channelName_ = QStringLiteral("test");
 
     QNetworkAccessManager* network_; // owned (parent = this)
     QTimer timer_;

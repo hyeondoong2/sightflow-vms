@@ -7,17 +7,23 @@ started yet (the project is currently in Phase 0, documentation/design; see
 not extend this design for multi-channel, motion detection, SQLite, or MCP
 until their phase begins — see `docs/DECISIONS.md` for why.
 
-**Two-channel exception (D20).** `sightflow-vms.exe` now displays exactly
-two hardcoded channels, "test" and "test2". Every class and mechanism below
-(`CaptureWorker`, `CaptureState`, `FrameQueue`, `VideoDisplayItem`, the
-retry loop, the thread model, the shutdown sequence) is unchanged and
-describes **one channel's** objects and behavior — read it that way
-throughout. `main.cpp` simply instantiates that entire one-channel object
-set twice, by literal duplication, not a loop or manager (D20); the two
-instances share no object, so nothing below needs to change to describe
-them both. This is a narrow, explicitly-scoped exception to this document's
-own single-channel framing, not a redesign for N channels — see D20 for
-what was deliberately *not* built (a channel list/manager, dynamic UI).
+**Two-channel exception (D20, D21).** `sightflow-vms.exe` now displays
+exactly two hardcoded channels, "test" and "test2" (D20), and
+`sightflow-server.exe` independently tracks both the same way (D21). Every
+class and mechanism below — client-side (`CaptureWorker`, `CaptureState`,
+`FrameQueue`, `VideoDisplayItem`, the retry loop, the thread model, the
+shutdown sequence) and server-side (`DecodeWorker`, `DecodeMetrics`,
+`DecodeMetricsService`, `ChannelStatusService`, `MediaMtxClient`) — is
+unchanged and describes **one channel's** objects and behavior — read it
+that way throughout. Both `main.cpp`s simply instantiate their respective
+one-channel object sets twice, by literal duplication, not a loop or
+manager (D20/D21); the two channels share no object on either side, so
+nothing below needs to change to describe them both.
+`ChannelStatusService`/`MediaMtxClient` were already channel-name-generic
+even before D21 and needed no change at all. This is a narrow,
+explicitly-scoped exception to this document's own single-channel framing,
+not a redesign for N channels — see D20/D21 for what was deliberately *not*
+built (a channel list/manager, dynamic UI).
 
 ## 1. Data flow
 
