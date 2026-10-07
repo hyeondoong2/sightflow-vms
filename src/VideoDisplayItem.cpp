@@ -7,7 +7,18 @@
 
 namespace {
 constexpr int kPollIntervalMs = 33; // docs/ARCHITECTURE.md §5: fixed, independent of source fps
+
+QString toDisplayString(CaptureState::State state)
+{
+    switch (state) {
+        case CaptureState::State::Connecting: return QStringLiteral("connecting");
+        case CaptureState::State::Retrying: return QStringLiteral("retrying");
+        case CaptureState::State::Running: return QStringLiteral("running");
+        case CaptureState::State::Stopped: return QStringLiteral("stopped");
+    }
+    return QStringLiteral("unknown");
 }
+} // namespace
 
 VideoDisplayItem::VideoDisplayItem(QQuickItem* parent)
     : QQuickPaintedItem(parent)
@@ -26,8 +37,36 @@ void VideoDisplayItem::setFrameQueue(FrameQueue* queue)
     timer_.start(kPollIntervalMs);
 }
 
+void VideoDisplayItem::setCaptureState(CaptureState* captureState)
+{
+    captureState_ = captureState;
+}
+
 void VideoDisplayItem::pollFrameQueue()
 {
+    if (captureState_) {
+        const QString newState = toDisplayString(captureState_->state());
+        if (newState != connectionState_) {
+            connectionState_ = newState;
+            emit connectionStateChanged();
+
+            if (newState != QStringLiteral("running")) {
+                // The connection just ended (or hasn't succeeded yet) --
+                // the previously displayed frame belongs to a session that
+                // is no longer current and must not keep looking live
+                // (D19). FrameQueue is also cleared by CaptureWorker itself
+                // at the same transition, so the *next* real frame (once
+                // reconnected) is guaranteed fresh, not a leftover.
+                image_ = QImage();
+                update();
+            }
+        }
+
+        if (connectionState_ != QStringLiteral("running")) {
+            return; // nothing to pop while not actually connected
+        }
+    }
+
     if (!queue_) {
         return;
     }

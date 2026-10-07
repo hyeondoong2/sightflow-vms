@@ -1,6 +1,7 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 
+#include "CaptureState.h"
 #include "CaptureWorker.h"
 #include "FrameQueue.h"
 #include "VideoDisplayItem.h"
@@ -15,11 +16,13 @@ int main(int argc, char* argv[])
     // reverse order, which is exactly the shutdown sequence
     // docs/ARCHITECTURE.md §7 requires -- `engine` first (tearing down the
     // QML tree, which stops VideoDisplayItem's poll timer), then `worker`
-    // (CaptureWorker::~CaptureWorker() requests stop and joins the capture
-    // thread), then `queue` last, once nothing can push to or pop from it
-    // anymore.
+    // (CaptureWorker::~CaptureWorker() requests stop -- interrupting both a
+    // blocking RTSP call and an in-progress retry-backoff wait, D19 -- and
+    // joins the capture thread), then `captureState`/`queue` last, once
+    // nothing can read or write them anymore.
     FrameQueue queue;
-    CaptureWorker worker(url, queue);
+    CaptureState captureState;
+    CaptureWorker worker(url, queue, captureState);
     worker.start();
 
     QQmlApplicationEngine engine;
@@ -31,6 +34,7 @@ int main(int argc, char* argv[])
     auto* displayItem = engine.rootObjects().constFirst()->findChild<VideoDisplayItem*>(QStringLiteral("videoDisplay"));
     if (displayItem) {
         displayItem->setFrameQueue(&queue);
+        displayItem->setCaptureState(&captureState);
     }
 
     return app.exec();

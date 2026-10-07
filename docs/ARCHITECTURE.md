@@ -14,18 +14,26 @@ RTSP URL
    │
    ▼
 [Capture/Decode worker thread]
-   RtspSource.open()                        (pre-allocated AVFormatContext, interrupt callback installed first)
-   loop while !stopRequested:
-     av_read_frame()             → AVPacket   (owned by RtspSource)
-     if packet belongs to the selected video stream:
-       Decoder.sendPacket(packet)             (packet handed to decoder)
-       repeat Decoder.receiveFrame() until EAGAIN / EOF / error:
-         → AVFrame                (decoded YUV frame, owned by Decoder, scoped to this call)
-         FrameConverter.convert() → VideoFrame  (app-owned: pixel buffer + width/height/stride/format)
-         FrameQueue.push(frame)   → drop-oldest if at capacity (2)
-     else:
-       (packet belongs to another stream, e.g. audio — not sent to the decoder)
-     AVPacket unref'd/released                (every code path, every iteration)
+   loop while !stopRequested:               (outer retry loop -- D19, supersedes D8)
+     CaptureState ← Connecting
+     RtspSource.open()                        (pre-allocated AVFormatContext, interrupt callback installed first)
+     on failure: CaptureState ← Retrying, FrameQueue.clear(), interruptible
+                 wait (fixed interval), then retry this loop -- unless
+                 stopRequested, in which case exit
+     CaptureState ← Running
+     loop while !stopRequested (this connected session):
+       av_read_frame()             → AVPacket   (owned by RtspSource)
+       if packet belongs to the selected video stream:
+         Decoder.sendPacket(packet)             (packet handed to decoder)
+         repeat Decoder.receiveFrame() until EAGAIN / EOF / error:
+           → AVFrame                (decoded YUV frame, owned by Decoder, scoped to this call)
+           FrameConverter.convert() → VideoFrame  (app-owned: pixel buffer + width/height/stride/format)
+           FrameQueue.push(frame)   → drop-oldest if at capacity (2)
+       else:
+         (packet belongs to another stream, e.g. audio — not sent to the decoder)
+       AVPacket unref'd/released                (every code path, every iteration)
+     on a dropped session (not a stop request): same as "on failure" above --
+                 CaptureState ← Retrying, FrameQueue.clear(), wait, retry
    │
    │  (thread boundary — FrameQueue is the only channel used to transfer
    │   video frame data between threads; see below for the separate
@@ -33,7 +41,11 @@ RTSP URL
    ▼
 [Qt UI thread]
    QTimer (fixed interval) ticks
-     → FrameQueue.tryPopLatest() → VideoFrame or nothing (non-blocking, never waits)
+     → reads CaptureState; on a transition away from Running, clears the
+       currently displayed image immediately (never shows a stale frame
+       from an ended session -- D19)
+     → if currently Running: FrameQueue.tryPopLatest() → VideoFrame or
+       nothing (non-blocking, never waits)
      → VideoDisplayItem displays it, previous VideoFrame is destroyed
 ```
 
@@ -63,9 +75,13 @@ lower-frequency than frame delivery:
 - The stop flag (`std::atomic<bool> stopRequested`, §7) — written by
   whichever thread requests a stop, read by the worker loop and by the
   interrupt callback. Carries no frame data, just a boolean.
-- A low-frequency connection-state notification (`Connecting` / `Connected`
-  / `Error` / `Stopped`) via a normal Qt queued signal that carries no frame
-  payload — it fires on state transitions, not per frame.
+- A low-frequency connection-state value (`CaptureState`: `Connecting` /
+  `Retrying` / `Running` / `Stopped`, D19) — a single `std::atomic<State>`
+  written by the worker on each transition, *polled* by `VideoDisplayItem`
+  on the same `QTimer` tick that already polls `FrameQueue` (not a Qt
+  signal — kept symmetric with how `FrameQueue` itself is polled rather
+  than signaled, D7). Carries no frame payload; changes on state
+  transitions only, not per frame.
 
 No FFmpeg type (`AVPacket`, `AVFrame`, `AVFormatContext`, `AVCodecContext`)
 ever crosses the thread boundary, and the worker never emits one Qt signal
@@ -155,10 +171,11 @@ change these classes then — see `docs/DECISIONS.md`.
 Two threads only:
 
 1. **Capture/decode worker thread** (owned by `CaptureWorker`) — runs the
-   demux → decode → convert → enqueue loop. Never touches Qt/QML objects
-   directly.
+   retry → demux → decode → convert → enqueue loop (D19). Never touches
+   Qt/QML objects directly.
 2. **Qt UI thread** — runs the Qt event loop and a `QTimer` that pulls from
-   `FrameQueue`; renders. Never calls into FFmpeg directly.
+   `FrameQueue` and polls `CaptureState`; renders. Never calls into FFmpeg
+   directly.
 
 The worker does **not** emit a queued Qt signal carrying a frame for every
 decoded frame. Doing so would hand frame delivery to Qt's event queue, which
@@ -166,10 +183,11 @@ has no capacity limit of its own — an idle or backed-up UI event loop would
 let queued frame-signals accumulate without bound, silently defeating the
 bounded-queue/drop policy this architecture relies on (see D7 in
 `docs/DECISIONS.md`). Frame delivery instead happens exclusively through
-`FrameQueue`, which the UI thread **polls** on its own schedule (§5). The only
-signal the worker emits is a small state-change notification
-(`Connecting`/`Connected`/`Error`/`Stopped`) with no frame payload — one of
-these firing far less often than once per frame is not a capacity risk.
+`FrameQueue`, which the UI thread **polls** on its own schedule (§5). The
+only other thing the worker exposes is `CaptureState`, a small state value
+(`Connecting`/`Retrying`/`Running`/`Stopped`, D19) the UI thread polls on
+the same tick — not a Qt signal, and not per frame, so it carries no
+capacity risk either.
 
 ## 4. The worker/UI boundary object: `VideoFrame`
 
@@ -267,23 +285,37 @@ Phase 1 testing shows a reason to.
 
 ## 6. Error handling
 
-- **Connection failure / timeout on open:** reported via the state signal
-  (`Error`), not a crash. No retry logic exists in Phase 1 — see §7 for why,
-  and D8 for the decision to explicitly exclude automatic reconnection.
+**Automatic retry (D19, supersedes D8's "no automatic reconnection").**
+`CaptureWorker` retries indefinitely on both a connection failure and a
+mid-stream drop — only an explicit `stop()` (window close) is terminal. Each
+retry waits a fixed interval (5s), interruptibly, before trying again; see
+§7 for how that wait is interrupted both by a stop request and by nothing
+else (it is not woken early by anything stream-related — there is no
+"retry now" trigger, only the fixed interval or a stop).
+
+- **Connection failure / timeout on open:** `CaptureState` transitions to
+  `Retrying`, `FrameQueue` is cleared (so no leftover frame from before this
+  failure can later be mistaken for one from the next successful
+  connection), and the worker waits the retry interval before attempting to
+  open the RTSP URL again. Not a crash, not terminal.
 - **Mid-stream network drop:** detected either by `av_read_frame` returning
   an error, or by the separate RTSP/network-level timeout (§7) expiring
   because the connection has silently gone dead. This timeout is a distinct
   safeguard from the interrupt callback (§7) — it is not "the interrupt
-  callback firing due to a timeout." Either way, the worker transitions to
-  `Error`, stops pushing frames, and exits its loop. It does **not**
-  automatically retry or reconnect.
+  callback firing due to a timeout." Either way, the worker stops pushing
+  frames, exits that session's inner loop, and takes the same
+  `Retrying`/clear/wait/retry path as a connection failure above.
 - **Decode error on a single frame/packet:** log and skip; do not stop the
   whole stream for one bad frame.
-- **Fatal/unexpected errors:** worker transitions to `Error`, stops cleanly
-  (§7), and surfaces the error via the state signal. The process never
-  crashes as a result of a single stream's failure.
-- Restarting after an `Error` or a user-initiated `Stop` both require a new,
-  explicit start action from the UI in Phase 1.
+- **Fatal/unexpected errors** (e.g. a frame conversion failure):
+  treated as ending the current session — same `Retrying`/clear/wait/retry
+  path, not a permanent stop. The process never crashes as a result of a
+  single stream's failure.
+- Only a user-initiated `Stop` (closing the window) is a terminal state in
+  Phase 1; `CaptureState` reports `Stopped` and the worker thread exits for
+  good. Nothing else requires a new explicit start action anymore — a
+  connection failure or a drop is retried automatically without any UI
+  action.
 
 ## 7. Shutdown: interrupting blocking FFmpeg calls
 
@@ -336,33 +368,52 @@ call; the network timeout is what protects against a dead connection when
   could block `av_read_frame` indefinitely.
 - When this timeout fires, it is *not* the interrupt callback firing and it
   is *not* a shutdown — it is treated as the mid-stream network drop case in
-  §6 (`Error`, no auto-reconnect).
+  §6 (`Retrying`, automatic retry after the fixed backoff interval, D19).
 
 **Shutdown sequence:**
 
-1. Stop is requested (UI action or app close) → `CaptureWorker` sets
-   `stopRequested = true`.
-2. If a blocking FFmpeg call is in progress, FFmpeg's next poll of the
-   interrupt callback sees `stopRequested` and aborts that call, returning an
-   error rather than continuing to block.
-3. The worker loop's top-of-loop check of `stopRequested` (or the error
-   propagated from the aborted call) causes it to break out of the loop.
-4. `Decoder` and `RtspSource` are destroyed (RAII), closing the codec and
-   format contexts.
-5. `CaptureWorker` joins the worker thread. This join is now bounded by "one
-   interrupt-callback poll interval," not by a full network timeout or an
-   indefinite hang.
-6. Any `VideoFrame`s remaining in `FrameQueue` are destroyed (buffers freed),
-   and the UI's currently-displayed frame and connection-state are
-   cleared/reset to an idle/disconnected state — no stale video frame from
-   the previous session is left on screen.
-7. The state signal reports `Stopped` (a user-requested stop is a distinct
-   terminal state from `Error` — it is not something to reconnect from).
+1. Stop is requested (window close → `~CaptureWorker()`) → `CaptureWorker`
+   sets `stopRequested = true` **while holding `waitMutex_`** (the same
+   mutex the retry-backoff wait holds throughout its check-then-wait
+   sequence), then calls `waitCv_.notify_all()`. Setting the flag under that
+   lock closes the lost-wakeup race: without it, the store could land in the
+   narrow window between the retry wait checking the predicate (still
+   false) and actually registering as waiting, in which case the
+   notification would reach no one yet asleep and this step would have to
+   wait out the rest of the retry interval instead of ending immediately
+   (D19).
+2. Two cases, depending on what the worker thread is doing right now:
+   - **Blocked in a connected session's FFmpeg call:** the next poll of the
+     `AVIOInterruptCB` sees `stopRequested` and aborts it, returning an
+     error rather than continuing to block.
+   - **Sleeping in the retry-backoff wait (not connected):** `notify_all()`
+     from step 1 wakes it immediately; it re-checks `stopRequested`, sees
+     it set, and does not retry.
+3. The worker loop's top-of-loop (and inner-loop) checks of `stopRequested`
+   cause it to break out of every loop level without taking the
+   `Retrying`/wait/retry path a non-stop failure would.
+4. `Decoder`, `RtspSource`, `FrameConverter`, the `AVPacket`/`AVFrame`
+   wrappers are destroyed (RAII), closing the codec and format contexts --
+   whether this was the first connection attempt or the Nth retry, exactly
+   the same as any other session end.
+5. `CaptureWorker` joins the worker thread. This join is now bounded by
+   whichever of "one interrupt-callback poll interval" or "effectively
+   immediate wake from the retry-backoff wait" applies — never by a full
+   retry interval, a full network timeout, or an indefinite hang.
+6. `FrameQueue` is cleared and the UI's currently-displayed frame is reset —
+   no stale video frame from the previous session is left on screen. (This
+   same clearing also already happens on every `Retrying` transition during
+   normal operation, D19 — shutdown is not the only time it runs.)
+7. `CaptureState` reports `Stopped` — a terminal state in Phase 1; nothing
+   automatically restarts from it. `Retrying` is not terminal (D19
+   supersedes that half of D8): it is itself the automatic-retry state, not
+   a dead end requiring a new user action.
 
 This guarantees the worker thread can always eventually exit and be joined:
-either it is between blocking calls and sees the stop flag directly, or it is
+either it is between blocking calls and sees the stop flag directly, it is
 inside a blocking call that the interrupt callback (backed, worst case, by
-the network timeout) will unblock.
+the network timeout) will unblock, or it is asleep in the retry-backoff wait
+and `notify_all()` wakes it immediately.
 
 **Stop → Start sequencing.** A new capture session must never begin until
 the previous worker thread has completely exited and been joined — Phase 1
@@ -380,10 +431,14 @@ stop request
 → only now may a new worker be started
 ```
 
-**Explicitly not implemented in Phase 1:** automatic reconnection. An `Error`
-or a `Stopped` state both simply end the current stream session; starting
-again is always a new, explicit user action, and only after the join above
-has completed. (See D8.)
+**Superseded by D19:** the paragraph above described starting a brand-new
+`CaptureWorker` instance after a full stop, which remains true as written
+(Phase 1 still only ever constructs one `CaptureWorker`, once, in
+`main()`). What changed is that a connection failure or a mid-stream drop no
+longer ends the *existing* worker's thread at all — it retries internally
+(§6) without ever reaching `Stopped` or needing a new instance. Only an
+explicit `stop()` (window close) ends the thread for good; see D19
+(supersedes D8's "no automatic reconnection").
 
 ## 8. Concurrency hazards considered
 

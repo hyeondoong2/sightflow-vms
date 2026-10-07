@@ -22,3 +22,9 @@ std::optional<VideoFrame> FrameQueue::tryPopLatest()
     frames_.clear(); // drop the moved-from newest slot and any older frame(s)
     return latest;
 }
+
+void FrameQueue::clear()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    frames_.clear();
+}

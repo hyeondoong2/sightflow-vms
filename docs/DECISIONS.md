@@ -178,6 +178,13 @@ some frames.
 
 ## D8 — Shutdown uses FFmpeg's interrupt callback (+ a network timeout as a safety net); no automatic reconnection in Phase 1
 
+**Superseded in part by D19.** The "no automatic reconnection" half of this
+decision no longer holds: `CaptureWorker` now retries automatically (D19).
+The interrupt-callback/network-timeout shutdown mechanism described below is
+unchanged and still accurate — D19 builds on it rather than replacing it.
+Left in place rather than rewritten, per this document's own rule (append a
+superseding entry, don't edit history).
+
 **Decision:** `RtspSource` installs an `AVIOInterruptCB` on a pre-allocated
 `AVFormatContext` (set before `avformat_open_input`, so the connection
 handshake itself is interruptible), backed by an `std::atomic<bool>` stop
@@ -717,3 +724,94 @@ and combining them would require a new server-side endpoint, out of scope
 here. The status strip can show up to one poll interval (2s) of staleness
 relative to the server's true current state — acceptable for a status
 display, not a control surface.
+
+---
+
+## D19 — `CaptureWorker` retries automatically on its own existing thread; supersedes D8's "no automatic reconnection" for the client
+
+**Decision:** `CaptureWorker` now retries indefinitely on both a failed
+connection attempt and a mid-session stream drop, instead of ending the
+thread, using the exact retry-loop shape the server's `DecodeWorker`
+established (D17): a fixed `kRetryIntervalMs` (5000ms) interruptible wait
+via a `std::condition_variable` that `stop()` notifies (with the flag set
+under the same mutex the waiter holds, closing the lost-wakeup race D17
+already identified and fixed), rate-limited failure logging (first attempt
+immediately, then every 10th), and a fresh `RtspSource`/`Decoder`/
+`FrameConverter`/`PacketPtr`/`FramePtr` per attempt with the previous
+attempt's released by RAII at scope exit before the next one allocates.
+This is adapted to `CaptureWorker`'s own boundary objects, not a copy of
+`DecodeWorker`'s files: `CaptureWorker` still owns `FrameConverter` and
+pushes into `FrameQueue` (which `DecodeWorker` has neither of), and reports
+its lifecycle through a new `CaptureState` (a single `std::atomic<State>`,
+`{Connecting, Retrying, Running, Stopped}`) rather than `DecodeMetrics`
+(`CaptureWorker` has no frame-count/last-size/error-message reporting
+requirement — that information already lives server-side via D16/D17, and
+duplicating it client-side was not asked for and is not needed to solve the
+stale-frame problem below).
+
+**The stale-frame problem and its two-part fix.** Before this change,
+nothing told `VideoDisplayItem` that the frame it was holding belonged to a
+connection that had already ended — on a drop, the UI thread would simply
+keep re-painting the last successfully decoded frame forever, which (once
+`CaptureWorker` could reconnect) would have made a stale frame from the
+*previous* session indistinguishable from a fresh one from the *new*
+session. Fixed in two places, each closing a different window:
+
+1. `FrameQueue` gains `clear()`. `CaptureWorker` calls it the moment a
+   session ends (inside the same path that transitions `CaptureState` to
+   `Retrying`, before the backoff wait) — so any frame pushed just before
+   the drop, and not yet popped by the UI's 33ms-interval timer, cannot
+   survive to be popped after the *next* connection succeeds and mistaken
+   for one of its frames.
+2. `VideoDisplayItem` now also polls `CaptureState` on its existing
+   `QTimer` tick (no second timer) via `setCaptureState()`. The moment it
+   observes a transition away from `Running`, it clears its own displayed
+   `QImage` and repaints immediately — covering the window *during* the
+   retry wait, before `FrameQueue::clear()` would even matter again, so the
+   last frame disappears right away rather than sitting on screen for the
+   retry interval. While not `Running`, it also skips `tryPopLatest()`
+   entirely (defensive — the queue should already be empty, but this
+   avoids relying on that).
+
+`VideoDisplayItem` exposes this as a new `connectionState` Q_PROPERTY
+(`"connecting"`/`"retrying"`/`"running"`/`"stopped"`), and
+`src/qml/Main.qml` renders it as centered text ("연결 중..."/"재연결
+중...") that disappears once `running`. This is deliberately a *second*,
+independent text element from the existing server-status strip
+(`ServerStatusModel`, D18): one is this window's own RTSP connection to the
+camera; the other is `sightflow-server.exe`'s own decode state reached over
+HTTP. Neither reads the other's property, and nothing here depends on
+`sightflow-server.exe` running at all.
+
+**Reason:** Requested directly by the user: start the client before the
+camera is publishing and have it pick up the stream once it appears,
+without restarting the process; keep working through a mid-stream drop the
+same way; never show a stale frame as if it were current; close the window
+promptly even mid-retry-wait; and do this as a client-side adaptation of
+the server's already-reviewed retry shape (D17), not a blind copy, and not
+a reversal of D17's own client/server distinction (D17 explicitly reserved
+the question of whether the client should ever get this — this entry is
+that question being answered, explicitly, now, by the user, for the
+client).
+
+**Alternatives considered:** Emitting a Qt signal from `CaptureWorker` for
+state changes (would require making the previously Qt-free `CaptureWorker`
+a `QObject`) — rejected in favor of polling `CaptureState` from
+`VideoDisplayItem`'s *existing* timer tick, identical in spirit to how
+`FrameQueue` itself is already polled rather than signaled (D7): one
+mechanism, no new Qt dependency added to the capture/decode thread's own
+class. Clearing only `FrameQueue` without also having `VideoDisplayItem`
+watch `CaptureState` — rejected: the queue being empty doesn't stop
+`VideoDisplayItem` from continuing to show whatever `QImage` it already
+copied out on an earlier tick, so the stale frame would still linger for up
+to the full retry interval. Reusing `DecodeMetrics` verbatim for
+`CaptureState` — rejected as carrying fields (`framesDecoded`,
+`lastFrameWidth/Height`, `lastError`) this class has no consumer for.
+
+**Trade-offs:** None identified beyond what D17 already accepted for the
+same retry shape (fixed-interval, no backoff/jitter; a `stop()` mid-wait is
+bounded by, not independent of, the same correctness fix D17 required).
+`docs/ARCHITECTURE.md` §1/§3/§6/§7, written when D8 was current, described
+a client that never retries; updated alongside this entry to describe the
+retry loop, the two-part stale-frame fix, and the shutdown sequence's
+interaction with the retry-backoff wait.

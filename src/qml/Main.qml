@@ -21,6 +21,23 @@ Window {
         anchors.fill: parent
     }
 
+    // Client's own RTSP connection state (CaptureWorker, D19) -- distinct
+    // from the server status strip below. "연결 중"/"재연결 중" is this
+    // window's own connection to the camera, not sightflow-server.exe's
+    // decode state. Hidden once actually running so it doesn't sit on top
+    // of live video.
+    Text {
+        anchors.centerIn: parent
+        visible: videoDisplay.connectionState !== "running"
+        color: "white"
+        font.pixelSize: 18
+        text: videoDisplay.connectionState === "retrying"
+            ? qsTr("재연결 중...")
+            : videoDisplay.connectionState === "stopped"
+                ? qsTr("연결 중지됨")
+                : qsTr("연결 중...")
+    }
+
     // Server status strip: polls sightflow-server.exe over HTTP
     // (ServerStatusModel, docs/DECISIONS.md D18) -- entirely separate from
     // the RTSP video above. "MediaMTX 송출" is MediaMTX's own view of

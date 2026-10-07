@@ -29,6 +29,12 @@ public:
     // empty. Never blocks.
     std::optional<VideoFrame> tryPopLatest();
 
+    // Drops every currently queued frame. Used when a capture session ends
+    // (D19): without this, a frame pushed just before a disconnect could
+    // still be sitting here and get displayed as if it belonged to the next
+    // (reconnected) session. Never blocks.
+    void clear();
+
 private:
     static constexpr std::size_t kCapacity = 2;
 
