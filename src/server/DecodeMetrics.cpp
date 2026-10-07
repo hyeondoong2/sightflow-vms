@@ -6,11 +6,21 @@ void DecodeMetrics::setState(State state)
     data_.state = state;
 }
 
-void DecodeMetrics::setError(const std::string& message)
+void DecodeMetrics::setRetrying(const std::string& message)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    data_.state = State::Error;
+    data_.state = State::Retrying;
     data_.lastError = message;
+}
+
+void DecodeMetrics::beginRunning()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    data_.state = State::Running;
+    data_.framesDecoded = 0;
+    data_.lastFrameWidth = 0;
+    data_.lastFrameHeight = 0;
+    data_.lastError.clear();
 }
 
 void DecodeMetrics::recordFrame(int width, int height)

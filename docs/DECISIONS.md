@@ -564,3 +564,82 @@ blocks it for up to one `AVIOInterruptCB` poll interval (or the RTSP network
 timeout in the worst case) — the same bounded, accepted shutdown latency
 documented for `CaptureWorker` in `docs/ARCHITECTURE.md` §7/D8, now paid once
 more on the server side.
+
+---
+
+## D17 — `DecodeWorker` retries automatically, on its own existing thread; this is a server-only exception to D8's "no auto-reconnect," not a reversal of it
+
+**Decision:** `DecodeWorker` (D16) now retries indefinitely on both a failed
+connection attempt and a mid-session stream drop, instead of ending the
+thread. The retry loop runs entirely on the *same* worker thread created by
+`start()` — no second thread, no thread pool, no IOCP, no work queue of any
+kind. On a failure, the worker calls `DecodeMetrics::setRetrying(message)`
+(state → `Retrying`) and waits `kRetryIntervalMs` (5000ms, a simple fixed
+value, not backoff/jitter) via a `std::condition_variable` that `stop()`
+notifies immediately — so a shutdown request ends the wait right away rather
+than after up to 5s of idle sleep. Every retry attempt constructs a fresh
+`RtspSource`/`Decoder`/`PacketPtr`/`FramePtr`; the previous attempt's are
+already destroyed (RAII, scope exit) before the new ones are allocated —
+nothing is reused across a retry. Console logging of failures is rate
+limited (first failure logged immediately, then only every 10th) so a
+long-dead source doesn't fill the log at one line per 5s forever.
+
+`DecodeMetrics` gains a `Retrying` state (distinct from `Connecting`, which
+now means "an attempt is in progress right now," for either the first
+attempt or any retry) and two new mutating entry points replacing the old
+single `setError`: `setRetrying()` (state → `Retrying`, records the failure
+reason, leaves `framesDecoded`/`lastFrameWidth`/`lastFrameHeight` untouched)
+and `beginRunning()` (state → `Running`, and — this is the semantics
+decision the user asked to pin down — resets `framesDecoded` and
+`lastFrameWidth`/`lastFrameHeight` to 0 and clears `lastError`).
+**`framesDecoded` is therefore scoped to the current/most-recently-ended
+connection, never a lifetime total across reconnects.** `GET
+/channels/<name>/metrics`'s JSON shape, field names, and the unrelated `GET
+/channels/<name>` endpoint (D14) are unchanged; `DecodeMetricsService` now
+includes `"error"` whenever `lastError` is non-empty (previously gated on a
+now-removed `Error` state) and maps the new `Retrying` state to
+`"state":"retrying"`.
+
+**This is scoped to `sightflow-server.exe`'s `DecodeWorker` only.** D8's
+decision — the Phase 1 client (`CaptureWorker`, `sightflow-vms.exe`) does
+*not* auto-reconnect after `Error`/`Stopped`, and a new session always
+requires an explicit user action — is unchanged and still in force for the
+client. The two are allowed to differ because they answer different
+questions for different consumers: `CaptureWorker` drives a UI a human is
+watching live, where silently retrying behind their back was explicitly
+rejected in D8; `DecodeWorker` drives a polled HTTP metrics endpoint with no
+human watching a retry happen, where the whole point of this change (per the
+user's own framing) is "don't make me restart the server just because the
+camera wasn't on yet." Neither decision reasons about or constrains the
+other. A reader must not cite this entry as grounds to add auto-reconnect to
+`CaptureWorker`, nor cite D8 as grounds to revert this one.
+
+**Reason:** Requested directly by the user, with explicit constraints: one
+worker thread only (no new thread/pool/IOCP/queue); fixed simple retry
+interval; rate-limited logging; fresh FFmpeg resources per retry via RAII;
+one pinned meaning for `framesDecoded`; `stop()` must return promptly during
+the retry wait, not just during connected I/O; and the client's D8 decision
+must not be confused with or silently overridden by this one.
+
+**Alternatives considered:** Exponential backoff with jitter (rejected as
+more than "단순한 고정값" asked for; revisit only if a fixed interval proves
+operationally too aggressive or too slow). A separate "reconnect manager"
+object/thread watching `DecodeWorker` from outside and restarting it
+(rejected — this is exactly the kind of extra thread/queue the user asked
+not to add; retrying in place on the same thread is strictly simpler). Making
+`framesDecoded` a lifetime total across reconnects (rejected per the user's
+explicit instruction not to let old decoded data look like evidence the
+current video is alive — a monotonically-climbing total would do exactly
+that across a reconnect).
+
+**Trade-offs:** A client polling `GET /channels/<name>/metrics` sees
+`framesDecoded` drop back to 0 on every reconnect, which looks like a
+regression if read as a lifetime counter instead of a per-session one — this
+is why the field's semantics are now spelled out in this entry, in
+`DecodeMetrics.h`'s own comments, and in `DecodeMetricsService.cpp`, not left
+implicit. `lastError` can persist (correctly) through a `Retrying` state and
+the following `Connecting` attempt before being cleared by the next
+`beginRunning()` — a consumer that treats any non-empty `error` field as "it
+is broken right now" rather than "this is what went wrong most recently"
+will misread it; `state` is the field that must be read for current
+liveness, `error` is context, not an alarm by itself.

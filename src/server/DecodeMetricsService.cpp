@@ -8,8 +8,8 @@ const char* stateToString(DecodeMetrics::State state)
 {
     switch (state) {
         case DecodeMetrics::State::Connecting: return "connecting";
+        case DecodeMetrics::State::Retrying: return "retrying";
         case DecodeMetrics::State::Running: return "running";
-        case DecodeMetrics::State::Error: return "error";
         case DecodeMetrics::State::Stopped: return "stopped";
     }
     return "unknown";
@@ -59,10 +59,15 @@ void DecodeMetricsService::handleRequest(const QString& method, const QString& p
     obj["channel"] = channel;
     obj["source"] = "decoder"; // this server's own decode worker -- see GET /channels/<name> for MediaMTX's view
     obj["state"] = stateToString(snapshot.state);
+    // framesDecoded/lastFrameWidth/lastFrameHeight describe the current (if
+    // state == running) or most recently ended (otherwise) connection only
+    // -- never a lifetime total (docs/DECISIONS.md D17). A caller must use
+    // `state`, not a nonzero frame count, to decide whether video is
+    // currently flowing.
     obj["framesDecoded"] = static_cast<qint64>(snapshot.framesDecoded);
     obj["lastFrameWidth"] = snapshot.lastFrameWidth;
     obj["lastFrameHeight"] = snapshot.lastFrameHeight;
-    if (snapshot.state == DecodeMetrics::State::Error) {
+    if (!snapshot.lastError.empty()) {
         obj["error"] = QString::fromStdString(snapshot.lastError);
     }
 

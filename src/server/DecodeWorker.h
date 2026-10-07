@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -13,6 +15,13 @@
 // directly -- no decode logic is duplicated. No pixel conversion
 // (FrameConverter), no FrameQueue, no display: this step only counts frames
 // and records their dimensions.
+//
+// Server-side-only automatic retry (D17): on a connect failure or a
+// mid-stream drop, this worker waits a fixed interval and tries again, on
+// the SAME thread -- no new thread, no thread pool, no work queue. This is
+// deliberately different from CaptureWorker/the client, which still never
+// auto-reconnects (D8, Phase 1 client scope) -- see D17 for why the two are
+// allowed to differ and are not in conflict.
 class DecodeWorker {
 public:
     // `metrics` must outlive this DecodeWorker.
@@ -26,21 +35,40 @@ public:
     DecodeWorker(DecodeWorker&&) = delete;
     DecodeWorker& operator=(DecodeWorker&&) = delete;
 
-    // Starts the worker thread. Call once per DecodeWorker (no
-    // restart/reconnect in this step -- mirrors D8).
+    // Starts the worker thread. Call once per DecodeWorker.
     void start();
 
-    // Requests the worker thread stop at its next opportunity -- this also
-    // interrupts any blocking FFmpeg call (connect or read) in progress --
-    // and joins it. Safe to call even if start() was never called, or after
-    // a previous stop().
+    // Requests the worker thread stop at its next opportunity -- this
+    // interrupts any blocking FFmpeg call in progress (same AVIOInterruptCB
+    // mechanism as CaptureWorker) AND wakes an in-progress retry backoff
+    // wait immediately (via waitCv_) -- then joins. Safe to call even if
+    // start() was never called, or after a previous stop().
     void stop();
 
 private:
     void run();
 
+    // Records `message` as the reason the attempt/session that just ended
+    // failed, logs it (rate-limited via `consecutiveFailures`), and waits
+    // out the retry interval -- interruptibly. Returns false if stop() was
+    // requested (caller must not retry, just exit), true if the interval
+    // elapsed normally (caller should attempt to (re)connect again).
+    bool retryAfterFailure(const std::string& message, int& consecutiveFailures);
+
+    // Waits up to kRetryIntervalMs, or returns as soon as stop() is called.
+    // Returns false if stop was requested, true if the interval elapsed.
+    bool waitBeforeRetry();
+
+    static constexpr int kRetryIntervalMs = 5000;
+    static constexpr int kLogEveryNFailures = 10; // avoid one log line per retry forever
+
     std::string url_;
     DecodeMetrics& metrics_;
     std::atomic<bool> stopRequested_{false};
     std::thread thread_;
+
+    // Guards only the interruptible retry-backoff wait -- never held across
+    // FFmpeg or socket I/O.
+    std::mutex waitMutex_;
+    std::condition_variable waitCv_;
 };

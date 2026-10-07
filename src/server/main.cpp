@@ -58,9 +58,12 @@ int main(int argc, char* argv[])
     // their response callbacks' QPointer guards go null), then abort any
     // MediaMTX request still in flight -- in that order, nothing tries to
     // write to an already-closed socket. DecodeWorker::stop() runs last: it
-    // interrupts its blocking RTSP I/O (same AVIOInterruptCB mechanism as
-    // CaptureWorker, §7) and joins the thread -- a bounded wait, not
-    // unconditional, but still a synchronous one on the Qt thread here.
+    // interrupts a blocking RTSP I/O call if one is in progress (same
+    // AVIOInterruptCB mechanism as CaptureWorker, §7), OR wakes an
+    // in-progress retry-backoff wait immediately (D17) if the worker is
+    // between connection attempts -- either way it then joins the thread. A
+    // bounded wait, not unconditional, but still a synchronous one on the
+    // Qt thread here.
     QObject::connect(&app, &QCoreApplication::aboutToQuit, [&httpServer, &mediaMtxClient, &decodeWorker]() {
         httpServer.shutdown();
         mediaMtxClient.abortAll();

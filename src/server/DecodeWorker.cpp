@@ -1,5 +1,7 @@
 #include "DecodeWorker.h"
 
+#include <iostream>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
@@ -29,90 +31,152 @@ void DecodeWorker::start()
 
 void DecodeWorker::stop()
 {
-    stopRequested_ = true;
+    {
+        // Setting the flag while holding the same mutex waitBeforeRetry()
+        // holds throughout its check-then-wait sequence closes the classic
+        // lost-wakeup race: without this lock, this store could land in the
+        // narrow window between the waiter checking the predicate (still
+        // false) and actually registering as waiting, in which case
+        // notify_all() below would reach no one yet asleep and the retry
+        // wait would only end once its full timeout elapsed (bounded, but
+        // not the "ends immediately" this is supposed to guarantee).
+        std::lock_guard<std::mutex> lock(waitMutex_);
+        stopRequested_ = true;
+    }
+    waitCv_.notify_all(); // wake an in-progress retry-backoff wait immediately
     if (thread_.joinable()) {
         thread_.join();
     }
 }
 
+bool DecodeWorker::waitBeforeRetry()
+{
+    std::unique_lock<std::mutex> lock(waitMutex_);
+    waitCv_.wait_for(lock, std::chrono::milliseconds(kRetryIntervalMs), [this] { return stopRequested_.load(); });
+    return !stopRequested_.load();
+}
+
+bool DecodeWorker::retryAfterFailure(const std::string& message, int& consecutiveFailures)
+{
+    ++consecutiveFailures;
+    metrics_.setRetrying(message);
+
+    // Log the first failure immediately, then only every Nth after that --
+    // a dead source can otherwise fill the console with an identical line
+    // every kRetryIntervalMs forever.
+    if (consecutiveFailures == 1 || consecutiveFailures % kLogEveryNFailures == 0) {
+        std::cerr << "DecodeWorker: attempt " << consecutiveFailures << " failed (" << message
+                   << "), retrying in " << (kRetryIntervalMs / 1000) << "s" << std::endl;
+    }
+
+    return waitBeforeRetry();
+}
+
 void DecodeWorker::run()
 {
-    metrics_.setState(DecodeMetrics::State::Connecting);
+    int consecutiveFailures = 0;
 
-    std::string sourceError;
-    std::unique_ptr<RtspSource> source = RtspSource::open(url_, stopRequested_, sourceError);
-    if (!source) {
-        if (stopRequested_.load()) {
-            metrics_.setState(DecodeMetrics::State::Stopped);
-        } else {
-            metrics_.setError(sourceError);
-        }
-        return;
-    }
+    while (!stopRequested_.load()) {
+        metrics_.setState(DecodeMetrics::State::Connecting);
 
-    const int videoStreamIndex = source->videoStreamIndex();
-
-    std::string decoderError;
-    std::unique_ptr<Decoder> decoder = Decoder::create(source->videoCodecParameters(), decoderError);
-    if (!decoder) {
-        metrics_.setError(decoderError);
-        return;
-    }
-
-    PacketPtr packet(av_packet_alloc());
-    FramePtr frame(av_frame_alloc());
-    if (!packet || !frame) {
-        metrics_.setError("Failed to allocate AVPacket/AVFrame");
-        return;
-    }
-
-    metrics_.setState(DecodeMetrics::State::Running);
-
-    bool errorOccurred = false;
-    bool fatalError = false;
-    while (!stopRequested_.load() && !fatalError) {
-        int ret = source->readPacket(packet.get());
-        if (ret < 0) {
-            if (!stopRequested_.load()) {
-                metrics_.setError(std::string("stream ended or read error: ") + avErrorToString(ret));
-                errorOccurred = true;
+        std::string sourceError;
+        std::unique_ptr<RtspSource> source = RtspSource::open(url_, stopRequested_, sourceError);
+        if (!source) {
+            if (stopRequested_.load()) {
+                break;
             }
-            break;
-        }
-
-        if (packet->stream_index != videoStreamIndex) {
-            av_packet_unref(packet.get());
+            if (!retryAfterFailure(sourceError, consecutiveFailures)) {
+                break;
+            }
             continue;
         }
 
-        ret = decoder->sendPacket(packet.get());
-        av_packet_unref(packet.get()); // packet's data is copied into the decoder; released every code path
+        const int videoStreamIndex = source->videoStreamIndex();
 
-        if (ret < 0) {
-            metrics_.setError(std::string("avcodec_send_packet failed: ") + avErrorToString(ret));
-            errorOccurred = true;
-            break;
+        std::string decoderError;
+        std::unique_ptr<Decoder> decoder = Decoder::create(source->videoCodecParameters(), decoderError);
+        if (!decoder) {
+            if (!retryAfterFailure(decoderError, consecutiveFailures)) {
+                break;
+            }
+            continue;
         }
 
-        // Drain every frame this packet made available (0, 1, or more).
-        while (!stopRequested_.load()) {
-            ret = decoder->receiveFrame(frame.get());
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                break; // needs another packet, or stream ended
+        PacketPtr packet(av_packet_alloc());
+        FramePtr frame(av_frame_alloc());
+        if (!packet || !frame) {
+            if (!retryAfterFailure("Failed to allocate AVPacket/AVFrame", consecutiveFailures)) {
+                break;
             }
+            continue;
+        }
+
+        // Connected: reset per-session counters (D17) and the failure
+        // streak now that an attempt has actually succeeded.
+        consecutiveFailures = 0;
+        metrics_.beginRunning();
+
+        bool sessionFailed = false;
+        std::string sessionError;
+        while (!stopRequested_.load()) {
+            int ret = source->readPacket(packet.get());
             if (ret < 0) {
-                metrics_.setError(std::string("avcodec_receive_frame failed: ") + avErrorToString(ret));
-                errorOccurred = true;
-                fatalError = true;
+                if (!stopRequested_.load()) {
+                    sessionFailed = true;
+                    sessionError = std::string("stream ended or read error: ") + avErrorToString(ret);
+                }
                 break;
             }
 
-            metrics_.recordFrame(frame->width, frame->height);
-            av_frame_unref(frame.get()); // must be clean before the next receiveFrame call
+            if (packet->stream_index != videoStreamIndex) {
+                av_packet_unref(packet.get());
+                continue;
+            }
+
+            ret = decoder->sendPacket(packet.get());
+            av_packet_unref(packet.get()); // packet's data is copied into the decoder; released every code path
+
+            if (ret < 0) {
+                sessionFailed = true;
+                sessionError = std::string("avcodec_send_packet failed: ") + avErrorToString(ret);
+                break;
+            }
+
+            // Drain every frame this packet made available (0, 1, or more).
+            bool fatalInnerError = false;
+            while (!stopRequested_.load()) {
+                ret = decoder->receiveFrame(frame.get());
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    break; // needs another packet, or stream ended
+                }
+                if (ret < 0) {
+                    sessionFailed = true;
+                    sessionError = std::string("avcodec_receive_frame failed: ") + avErrorToString(ret);
+                    fatalInnerError = true;
+                    break;
+                }
+
+                metrics_.recordFrame(frame->width, frame->height);
+                av_frame_unref(frame.get()); // must be clean before the next receiveFrame call
+            }
+            if (fatalInnerError) {
+                break;
+            }
+        }
+
+        // `source`/`decoder`/`packet`/`frame` go out of scope here, at the
+        // end of this iteration's block -- RAII releases every FFmpeg
+        // resource from this connection attempt before the next iteration
+        // (if any) allocates fresh ones. Nothing from this session is ever
+        // reused across a retry.
+
+        if (stopRequested_.load()) {
+            break;
+        }
+        if (sessionFailed && !retryAfterFailure(sessionError, consecutiveFailures)) {
+            break;
         }
     }
 
-    if (!errorOccurred) {
-        metrics_.setState(DecodeMetrics::State::Stopped);
-    }
+    metrics_.setState(DecodeMetrics::State::Stopped);
 }
