@@ -6,15 +6,19 @@
 #include <string>
 #include <thread>
 
+#include "ChangeEventLog.h"
 #include "DecodeMetrics.h"
 
 // Owns a dedicated decode worker thread: RTSP connect -> read -> decode,
 // recording frame count/last-frame size/run state into a caller-owned
-// DecodeMetrics (docs/DECISIONS.md D16). Mirrors CaptureWorker's
+// DecodeMetrics (docs/DECISIONS.md D16), and screen-change events into a
+// caller-owned ChangeEventLog (D22). Mirrors CaptureWorker's
 // thread/ownership shape (src/CaptureWorker.h) and reuses RtspSource/Decoder
-// directly -- no decode logic is duplicated. No pixel conversion
-// (FrameConverter), no FrameQueue, no display: this step only counts frames
-// and records their dimensions.
+// directly -- no decode logic is duplicated. No pixel conversion for
+// display (FrameConverter), no FrameQueue, no display: this worker counts
+// frames, records their dimensions, and runs a lightweight per-frame screen
+// change check (ChangeDetector) entirely on this same thread -- no second
+// worker thread, no work queue, no AVFrame ever crosses a thread boundary.
 //
 // Server-side-only automatic retry (D17): on a connect failure or a
 // mid-stream drop, this worker waits a fixed interval and tries again, on
@@ -24,8 +28,8 @@
 // allowed to differ and are not in conflict.
 class DecodeWorker {
 public:
-    // `metrics` must outlive this DecodeWorker.
-    DecodeWorker(std::string url, DecodeMetrics& metrics);
+    // `metrics` and `changeEventLog` must both outlive this DecodeWorker.
+    DecodeWorker(std::string url, DecodeMetrics& metrics, ChangeEventLog& changeEventLog);
 
     // Requests stop (if running) and joins the worker thread.
     ~DecodeWorker();
@@ -64,6 +68,7 @@ private:
 
     std::string url_;
     DecodeMetrics& metrics_;
+    ChangeEventLog& changeEventLog_;
     std::atomic<bool> stopRequested_{false};
     std::thread thread_;
 

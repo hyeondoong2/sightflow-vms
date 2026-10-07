@@ -25,6 +25,21 @@ explicitly-scoped exception to this document's own single-channel framing,
 not a redesign for N channels — see D20/D21 for what was deliberately *not*
 built (a channel list/manager, dynamic UI).
 
+**Change-detection exception (D22).** Each channel's `DecodeWorker` also
+runs a `ChangeDetector` inline, on the same decode thread, right after each
+decoded frame and before it is unref'd: it downscales the frame to a tiny
+grayscale thumbnail via its own `SwsContext` (same RAII pattern as
+`FrameConverter`, §2) and compares it against the previous thumbnail. A
+`double` change ratio (never an `AVFrame`, never a pixel buffer) is the only
+thing this produces that crosses into `ChangeEventLog`, a bounded
+mutex-guarded container with the same shape as `FrameQueue` (§5), read by
+the HTTP thread via `GET /channels/<name>/events`
+(`ChangeEventService`). This is explicitly **not** OpenCV, and explicitly
+**not** motion/object detection — see D22 for exactly what it measures, why
+each threshold constant was chosen, and its known false-positive/
+false-negative risk. Like D20/D21, this is a narrow Phase 1 exception, not
+Phase 3 (`docs/ROADMAP.md`) having begun.
+
 ## 1. Data flow
 
 ```

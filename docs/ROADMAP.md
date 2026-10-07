@@ -26,10 +26,11 @@ Phase 1 (implementation) has not started.
   `docs/ARCHITECTURE.md`. One stream, one capture/decode thread, one Qt UI
   thread, bounded frame queue, basic connect/stop/error states. No
   multi-channel, OpenCV, SQLite, REST/WebSocket, or MCP — except
-  `sightflow-server.exe`'s MediaMTX-status/decode-metrics endpoints and the
-  client displaying video, both now covering exactly two fixed channels,
-  "test"/"test2" (D14/D20 client, D21 server), all added at the user's
-  explicit direction; see `docs/DECISIONS.md`.
+  `sightflow-server.exe`'s MediaMTX-status/decode-metrics/change-event
+  endpoints and the client displaying video and status, all now covering
+  exactly two fixed channels, "test"/"test2" (D14/D20 client, D21 server),
+  and the server's non-OpenCV "화면 변화 감지" thumbnail comparison (D22),
+  all added at the user's explicit direction; see `docs/DECISIONS.md`.
 - **Step 0 (environment setup):** Exact toolchain versions (MSVC, CMake, Qt,
   FFmpeg) are **TBD** — not fixed by this documentation. They are to be
   selected and verified at the start of Phase 1 implementation, before any
@@ -70,6 +71,13 @@ Phase 1 (implementation) has not started.
 ## Phase 3 — Motion detection
 
 - **Goal:** Run motion detection on decoded frames per channel.
+- **Note:** D22 (`docs/DECISIONS.md`) already runs a lightweight, non-OpenCV
+  "화면 변화 감지" (screen change detection) check per channel — a
+  downscaled-thumbnail pixel comparison, explicitly not motion or object
+  detection — as a narrow Phase 1 exception, not a Phase 3 implementation.
+  Whether this phase replaces, extends, or runs alongside that check (and
+  whether OpenCV changes what D22 already measures) is an open question for
+  when this phase actually begins, not decided by D22.
 - **Scope:** Expected to introduce OpenCV. Detailed scope written when this
   phase begins.
 - **Completion criteria:** TBD when phase begins.

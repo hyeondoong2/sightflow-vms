@@ -988,3 +988,191 @@ to even for error messages that don't otherwise mention it. Only the log
 output was affected -- `DecodeMetrics` (the data each endpoint actually
 reports) was never at risk, since it was already mutex-protected
 per-instance (D16).
+
+---
+
+## D22 — "화면 변화 감지" (screen change detection): a lightweight downscaled-thumbnail comparison inside each DecodeWorker, not motion/object detection; deliberate, narrow exception to the OpenCV/motion-detection exclusion
+
+**Decision:** Each `DecodeWorker` (one per fixed channel, D21) now runs a
+`ChangeDetector` on its own thread, inline in its existing decode loop,
+right after each `avcodec_receive_frame()` success and before that
+`AVFrame` is unref'd. `ChangeDetector`:
+
+1. Throttles itself to roughly one comparison every `kCompareInterval`
+   (200ms) — most decoded frames are skipped outright.
+2. On a comparison, uses its own `SwsContext` (RAII via the exact
+   `SwsContextPtr`/`sws_getCachedContext` pattern `FrameConverter` already
+   established, D5/D12 — not a new pattern) to downscale the frame to a
+   tiny `kSampleWidth`×`kSampleHeight` (32×24) `AV_PIX_FMT_GRAY8` thumbnail.
+3. Compares that thumbnail, pixel by pixel, against the previous one: a
+   pixel counts as "changed" if its brightness moved by more than
+   `kPixelDiffThreshold` (25/255); the comparison's change ratio is
+   `changed / total`.
+4. Requires the ratio to clear `kChangeRatioThreshold` (0.03 — see the
+   measured-not-guessed note below) on at least `kDetectionsRequiredInWindow`
+   (2) of the last `kDetectionWindowSize` (3) comparisons before it counts
+   as sustained change, then enforces `kEventCooldown` (3000ms) before the
+   next event can fire even if the change continues.
+
+Every constant above is named and commented in `src/server/ChangeDetector.h`
+itself, not buried in `.cpp` logic — this entry records *why* each was
+chosen (restated briefly): 200ms balances responsiveness against not
+burning CPU on every decoded frame; a 32×24 thumbnail is cheap to compare
+and still holds real spatial structure (not one averaged brightness value);
+25/255 and 0.03 both exist to separate genuine scene change from per-pixel
+codec noise in an otherwise static picture (0.03's exact value is explained
+below — it was measured, not picked a priori); requiring 2-of-the-last-3
+rather than 2-strictly-in-a-row rejects a single-comparison fluke while
+tolerating one ordinary skipped/duplicate-looking comparison (see the bug
+note below); the 3s cooldown turns one sustained change into one event
+instead of a flood of near-duplicates roughly every 200ms for as long as it
+lasts.
+
+**Bug found and fixed while testing this entry, the same day it was
+written — same pattern as D21's log-interleaving fix.** The first
+implementation used a *strict* consecutive counter (`kConsecutiveDetections
+Required`, reset to 0 on any single comparison below threshold) and a
+`kChangeRatioThreshold` of 0.15, chosen by reasoning alone before any
+measurement. Verifying against FFmpeg `lavfi` test sources exposed two
+real problems, confirmed by temporarily logging every comparison's ratio:
+
+1. **The strict counter never fired at all, against any test source tried**
+   (`testsrc`, then `mandelbrot`). Logged ratios alternated almost exactly
+   between a real, substantial value and precisely `0` every other
+   comparison — i.e. one comparison in every pair compared a frame against
+   an effectively identical duplicate, a normal consequence of frame-rate
+   padding/low-bitrate frame skipping in both encoders generally and these
+   test sources specifically, not a defect in them. That single `0` reset
+   the strict counter every time, so two genuinely-changing comparisons
+   were never seen as "consecutive" even though real, sustained change was
+   clearly present. Fixed by replacing the strict counter with the
+   `kDetectionWindowSize`/`kDetectionsRequiredInWindow` sliding-window check
+   described above, which tolerates exactly this kind of single ordinary
+   miss.
+2. **Even after that fix, `testsrc` still produced zero events**, because
+   its real (non-duplicate) comparisons measured only ratios around
+   0.03-0.05 — `testsrc`'s moving clock digit and scrolling color gradient
+   occupy a modest fraction of the frame, and the gradient's hue cycles
+   without much brightness change (this check is grayscale-only), so even
+   genuine continuous motion produced a smaller ratio than the a-priori
+   0.15 guess assumed. `mandelbrot`, by contrast, measured ~0.25-0.37 on its
+   real comparisons — confirming the detector logic itself was sound once
+   the window fix was in place, and that 0.15 was simply too high a bar for
+   `testsrc`-level change specifically. `kChangeRatioThreshold` was lowered
+   to 0.03 — just above the exactly-`0.0` a truly static source always
+   produces, and at the level real `testsrc` change actually measured — so
+   both the static control stream and a genuinely changing one would behave
+   as intended in verification (see Test results below). This is exactly
+   the kind of value this project's "measure, don't guess" rule (D5) calls
+   for; it is not claimed to be right for real camera footage, only for
+   what was actually measured here (see Trade-offs).
+
+**What this explicitly is not, and the UI/API wording this decision
+requires.** This measures "how much of a small, blurred version of the
+picture changed between two samples" — nothing more. It cannot and does not
+attempt to distinguish a person from a moving shadow, a lighting change, a
+camera auto-exposure adjustment, compression artifacts after a scene cut,
+or any other cause of a brightness change covering enough of the frame.
+Every surface this feature exposes — `ChangeDetector`'s own doc comments,
+`ChangeEventLog`/`ChangeEvent`'s doc comments, `ChangeEventService`'s JSON
+(`"source": "change-detector"`, field name `changeRatio` not e.g.
+`"confidence"` or `"objectsDetected"`), and `src/qml/Main.qml`'s UI text —
+uses the literal label **"화면 변화 감지"** (screen change detection) and
+phrasing that describes a measured picture-change ratio, never wording that
+implies person/object/motion recognition (e.g. never "사람 감지됨",
+"움직임 포착"). This was an explicit user requirement, not a stylistic
+choice: a reader of the UI or the API must not come away believing this
+is more than it is.
+
+**Per-channel independence and the reconnect-reset requirement.** A fresh
+`ChangeDetector` is constructed as a local variable at the same point in
+`DecodeWorker::run()` where `metrics_.beginRunning()` already runs (right
+after a connection attempt succeeds) — the exact same place `FrameConverter`
+is already fresh-per-session on the client side (`CaptureWorker::run()`).
+Because its comparison baseline (`previousSample_`) starts empty every time,
+the first frame of any new session (including the first frame after a
+reconnect) only ever *establishes* that baseline and can never itself be
+compared against a stale thumbnail from a different session or a different
+channel — this is what directly satisfies "재연결 첫 프레임이 이벤트로
+기록되지 않게" without needing an explicit `reset()` call anywhere.
+`test` and `test2` each get their own `ChangeDetector` (session-scoped, as
+above) and their own `ChangeEventLog` (process-lifetime, D21-style literal
+duplication in `main.cpp`) — neither channel's detector state or event
+history is ever touched by the other's worker thread.
+
+**The boundary object: `ChangeEventLog`.** Mirrors `FrameQueue`'s exact
+bounded-`std::deque`-plus-`std::mutex` shape (`docs/ARCHITECTURE.md` §5):
+fixed capacity (`kChangeEventLogCapacity` = 20, in `main.cpp`, one per
+channel), oldest dropped first once full, mutex held only for the brief
+copy in/out. This is the *only* thing that crosses from `ChangeDetector`'s
+work back across the worker/HTTP-thread boundary — a timestamp and a
+`double` ratio, never an `AVFrame`, a pixel buffer, or any FFmpeg type.
+`GET /channels/<name>/events` (`ChangeEventService`, exact-path-routed in
+`main.cpp` exactly like the `/metrics` routes, D21) reads it via
+`recentEvents()`, which never blocks — same "small mutex-guarded copy,
+never held across FFmpeg or socket I/O" discipline every other
+worker-to-HTTP-thread object in this codebase already follows
+(`DecodeMetrics`, `FrameQueue`, `CaptureState`). `GET /channels/<name>` and
+`GET /channels/<name>/metrics` are completely unchanged — this is a new,
+additive endpoint, not a modification to either existing contract.
+
+**Client display.** `ServerStatusModel` (D18/D21) gains a third async query,
+`GET /channels/<channelName>/events`, polled on the same timer tick and
+following the exact same `*Reachable`-flag-plus-paired-value pattern as the
+other two queries (so a server/MediaMTX outage shows "서버 연결 안 됨"
+instead of the last successful event count looking current, D18). Each
+channel pane in `src/qml/Main.qml` gets its own new status line, below the
+existing MediaMTX/decode-state line, reporting only its own channel's
+`ServerStatusModel` instance — distinct from that same pane's
+`VideoDisplayItem.connectionState` (the client's own RTSP connection, D19)
+and from the other pane's everything.
+
+**Reason:** Requested directly by the user as the next incremental step.
+`docs/REQUIREMENTS.md` ("Explicitly out of scope for Phase 1") excludes
+"OpenCV or any motion/image-analysis processing" outright, and
+`docs/ROADMAP.md` names Phase 3 "Motion detection" as a distinct future
+phase expected to introduce OpenCV. This entry is a deliberate, narrow
+exception to that exclusion, in the same spirit as D14/D20/D21: no OpenCV
+was added (the comparison is plain pixel-array arithmetic over an
+FFmpeg-produced `sws_scale` thumbnail, no new dependency), no second worker
+thread or general-purpose frame-processing queue was added (explicit user
+constraint), and the feature is scoped to exactly the two existing fixed
+channels via the same literal-duplication shape D20/D21 already
+established — not a general detection framework.
+
+**Alternatives considered:** Comparing full-resolution frames directly —
+rejected: proportional to resolution× for no benefit, when a tiny thumbnail
+already captures "did the picture meaningfully change" just as well and far
+more cheaply. Comparing every decoded frame instead of throttling by time —
+rejected as unnecessary CPU for no detection-quality benefit, since a real
+change persists far longer than one frame interval. A second worker thread
+per channel dedicated to frame analysis, fed by a new packet/frame queue
+from the existing decode thread — rejected outright per the user's explicit
+instruction not to add a worker thread or general-purpose queue before it's
+needed; the comparison is cheap enough (a 32×24 byte array, throttled to
+5/sec) to run inline on the existing decode thread with no measured
+justification for more. Using OpenCV's `absdiff`/`countNonZero` or a
+built-in background-subtractor — rejected: pulls in a new dependency this
+phase explicitly excludes, for a problem plain-array arithmetic over an
+already-available `sws_scale` thumbnail solves adequately at this scope.
+
+**Trade-offs and known false-positive/false-negative risk.** This explicitly
+cannot tell a real scene event (a person entering frame) apart from a
+large-enough lighting change, a camera auto-exposure/auto-focus adjustment,
+or compression artifacts around a keyframe/scene cut — any of these can
+cross the same ratio threshold and fire an event; conversely, a real but
+small or slow-moving change (something small moving far from the camera, or
+a very gradual change) may never cross `kChangeRatioThreshold` and so never
+fires one. `kChangeRatioThreshold` = 0.03 was tuned from direct measurement
+against synthetic FFmpeg `lavfi` test patterns (`testsrc`, `mandelbrot`),
+not real camera footage — see the bug note above for the actual measured
+values. Because that threshold is now close to the noise floor
+(`kPixelDiffThreshold` already filters per-pixel codec noise, but a very
+busy real scene's residual thumbnail-level noise after that filter is
+untested), real footage may turn out to need a *higher* threshold than
+`testsrc` did to avoid noise-driven false events — this is exactly the kind
+of adjustment this project's "optimize/tune only after measurement" rule
+(D5) anticipates, not a claim that 0.03 is correct beyond what was measured
+here. `changeRatio` in the API is the *triggering comparison's* ratio at
+the moment the event fired (after the sliding window already cleared
+`kDetectionsRequiredInWindow`) — not an average or a confidence score.

@@ -49,7 +49,13 @@ Do not design or implement any of the following as part of Phase 1, even partial
   `docs/DECISIONS.md`. No channel-list data model, dynamic add/remove UI, or
   general N-channel infrastructure was added on either side; this does not
   widen the exclusion beyond those two fixed channels.
-- OpenCV or any motion/image-analysis processing.
+- OpenCV or any motion/image-analysis processing. **Exception:** each
+  channel's `DecodeWorker` runs a lightweight "화면 변화 감지" (screen
+  change detection) check — a downscaled-thumbnail pixel comparison, no
+  OpenCV, explicitly not motion/object detection — at the user's explicit
+  direction ahead of this phase boundary; see D22 in `docs/DECISIONS.md`.
+  Does not widen this exclusion for anything else; no OpenCV dependency, no
+  object/person recognition, was added.
 - SQLite or any persistence of events/metadata.
 - REST or WebSocket APIs. **Exception:** `sightflow-server.exe`
   (`GET /channels/<name>`, a MediaMTX status query) was added at the user's

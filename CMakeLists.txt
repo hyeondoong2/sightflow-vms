@@ -60,6 +60,9 @@ qt_add_executable(sightflow-server
     src/server/DecodeMetrics.cpp
     src/server/DecodeWorker.cpp
     src/server/DecodeMetricsService.cpp
+    src/server/ChangeDetector.cpp
+    src/server/ChangeEventLog.cpp
+    src/server/ChangeEventService.cpp
     src/RtspSource.cpp
     src/Decoder.cpp
 )

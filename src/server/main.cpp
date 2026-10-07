@@ -7,6 +7,8 @@
 #include <windows.h>
 #endif
 
+#include "ChangeEventLog.h"
+#include "ChangeEventService.h"
 #include "ChannelStatusService.h"
 #include "DecodeMetrics.h"
 #include "DecodeMetricsService.h"
@@ -17,6 +19,12 @@
 namespace {
 constexpr quint16 kListenPort = 8080;
 const char* kMediaMtxApiBaseUrl = "http://127.0.0.1:9997";
+
+// How many of a channel's most recent "화면 변화 감지" events stay in
+// memory (ChangeEventLog, D22). 20 is enough to show a short recent history
+// per channel without the log growing unbounded; older events are simply
+// dropped, not persisted anywhere.
+constexpr std::size_t kChangeEventLogCapacity = 20;
 }
 
 int main(int argc, char* argv[])
@@ -33,30 +41,43 @@ int main(int argc, char* argv[])
 
     // Two fixed channels, "test" and "test2" (mirrors the client's D20):
     // each gets its own independent DecodeWorker thread + DecodeMetrics +
-    // DecodeMetricsService, by literal duplication, not a channel
-    // registry/array (docs/DECISIONS.md D21). Neither channel's worker
-    // thread, metrics, or retry/shutdown behavior ever touches the other's.
+    // DecodeMetricsService + ChangeEventLog + ChangeEventService, by literal
+    // duplication, not a channel registry/array (D21/D22). Neither
+    // channel's worker thread, metrics, retry/shutdown behavior, or change
+    // detection state ever touches the other's.
     DecodeMetrics decodeMetricsTest;
-    DecodeWorker decodeWorkerTest("rtsp://127.0.0.1:8554/test", decodeMetricsTest);
+    ChangeEventLog changeEventLogTest(kChangeEventLogCapacity);
+    DecodeWorker decodeWorkerTest("rtsp://127.0.0.1:8554/test", decodeMetricsTest, changeEventLogTest);
     decodeWorkerTest.start();
     DecodeMetricsService decodeMetricsServiceTest(QStringLiteral("test"), decodeMetricsTest);
+    ChangeEventService changeEventServiceTest(QStringLiteral("test"), changeEventLogTest);
 
     DecodeMetrics decodeMetricsTest2;
-    DecodeWorker decodeWorkerTest2("rtsp://127.0.0.1:8554/test2", decodeMetricsTest2);
+    ChangeEventLog changeEventLogTest2(kChangeEventLogCapacity);
+    DecodeWorker decodeWorkerTest2("rtsp://127.0.0.1:8554/test2", decodeMetricsTest2, changeEventLogTest2);
     decodeWorkerTest2.start();
     DecodeMetricsService decodeMetricsServiceTest2(QStringLiteral("test2"), decodeMetricsTest2);
+    ChangeEventService changeEventServiceTest2(QStringLiteral("test2"), changeEventLogTest2);
 
     HttpServer httpServer;
-    httpServer.setHandler([&channelStatusService, &decodeMetricsServiceTest, &decodeMetricsServiceTest2](
+    httpServer.setHandler([&channelStatusService, &decodeMetricsServiceTest, &decodeMetricsServiceTest2,
+                               &changeEventServiceTest, &changeEventServiceTest2](
                                const QString& method, const QString& path, RespondFn respond) {
-        // Exact-path routing for the two fixed metrics endpoints -- not a
-        // generic "strip /metrics and look up a channel" dispatcher, since
-        // there are deliberately only two channels to route to (D21).
+        // Exact-path routing for the fixed per-channel endpoints -- not a
+        // generic "strip the suffix and look up a channel" dispatcher,
+        // since there are deliberately only two channels to route to
+        // (D21/D22). GET /channels/<name> and GET /channels/<name>/metrics
+        // keep their existing response contracts unchanged (D14/D16/D17);
+        // GET /channels/<name>/events is new (D22).
         if (path == QStringLiteral("/channels/test/metrics")) {
             decodeMetricsServiceTest.handleRequest(method, path, std::move(respond));
         } else if (path == QStringLiteral("/channels/test2/metrics")) {
             decodeMetricsServiceTest2.handleRequest(method, path, std::move(respond));
-        } else if (path.endsWith(QStringLiteral("/metrics"))) {
+        } else if (path == QStringLiteral("/channels/test/events")) {
+            changeEventServiceTest.handleRequest(method, path, std::move(respond));
+        } else if (path == QStringLiteral("/channels/test2/events")) {
+            changeEventServiceTest2.handleRequest(method, path, std::move(respond));
+        } else if (path.endsWith(QStringLiteral("/metrics")) || path.endsWith(QStringLiteral("/events"))) {
             respond(404, "text/plain", "Not Found");
         } else {
             channelStatusService.handleRequest(method, path, std::move(respond));

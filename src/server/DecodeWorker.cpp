@@ -10,12 +10,14 @@ extern "C" {
 
 #include "AvError.h"
 #include "AvRaii.h"
+#include "ChangeDetector.h"
 #include "Decoder.h"
 #include "RtspSource.h"
 
-DecodeWorker::DecodeWorker(std::string url, DecodeMetrics& metrics)
+DecodeWorker::DecodeWorker(std::string url, DecodeMetrics& metrics, ChangeEventLog& changeEventLog)
     : url_(std::move(url))
     , metrics_(metrics)
+    , changeEventLog_(changeEventLog)
 {
 }
 
@@ -125,9 +127,15 @@ void DecodeWorker::run()
         }
 
         // Connected: reset per-session counters (D17) and the failure
-        // streak now that an attempt has actually succeeded.
+        // streak now that an attempt has actually succeeded. A fresh
+        // ChangeDetector per session (D22) means its comparison baseline is
+        // always empty right after a (re)connect -- this session's first
+        // frame is only ever used to establish that baseline, never
+        // compared against a previous session's, so it can never itself be
+        // reported as a change.
         consecutiveFailures = 0;
         metrics_.beginRunning();
+        ChangeDetector changeDetector;
 
         bool sessionFailed = false;
         std::string sessionError;
@@ -170,6 +178,14 @@ void DecodeWorker::run()
                 }
 
                 metrics_.recordFrame(frame->width, frame->height);
+
+                // Reads frame->data/linesize while the frame is still valid
+                // (before unref below) -- never stores the AVFrame or a
+                // pointer into it; only a ratio, if any, crosses out.
+                if (const std::optional<double> changeRatio = changeDetector.processFrame(frame.get())) {
+                    changeEventLog_.record(*changeRatio);
+                }
+
                 av_frame_unref(frame.get()); // must be clean before the next receiveFrame call
             }
             if (fatalInnerError) {

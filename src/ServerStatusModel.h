@@ -4,14 +4,16 @@
 #include <QQmlEngine>
 #include <QString>
 #include <QTimer>
+#include <QVariantList>
 
 class QNetworkAccessManager;
 class QNetworkReply;
 
-// Periodically polls sightflow-server.exe's two read-only status endpoints
-// for one channel -- GET /channels/<channelName>, GET
-// /channels/<channelName>/metrics -- over Qt's async network API and
-// exposes the results as QML-bindable properties. Fully self-contained
+// Periodically polls sightflow-server.exe's three read-only status
+// endpoints for one channel -- GET /channels/<channelName>, GET
+// /channels/<channelName>/metrics, GET /channels/<channelName>/events --
+// over Qt's async network API and exposes the results as QML-bindable
+// properties. Fully self-contained
 // (owns its own QNetworkAccessManager and QTimer) -- unlike
 // VideoDisplayItem, nothing needs to be wired in from main.cpp, so it can
 // be declared directly in QML.
@@ -65,6 +67,21 @@ class ServerStatusModel : public QObject {
     Q_PROPERTY(QString decodeState READ decodeState NOTIFY statusChanged)
     Q_PROPERTY(qlonglong framesDecoded READ framesDecoded NOTIFY statusChanged)
 
+    // From GET /channels/<channelName>/events -- this channel's own
+    // "화면 변화 감지" (screen change detection) history (D22). Only
+    // meaningful when changeEventsReachable is true. Never to be read as a
+    // person/object/motion detection result -- see docs/DECISIONS.md D22
+    // for exactly what the underlying measurement is.
+    Q_PROPERTY(bool changeEventsReachable READ changeEventsReachable NOTIFY statusChanged)
+
+    // Up to kMaxDisplayedEvents (5) individual recent events, newest first,
+    // each a QVariantMap{"time": QString ("hh:mm:ss", local time),
+    // "ratio": double (0.0-1.0)} -- QML reads recentChangeEvents.length for
+    // a count and recentChangeEvents[0] for "the last one" rather than
+    // separate summary properties, so there is exactly one source of truth
+    // for this data.
+    Q_PROPERTY(QVariantList recentChangeEvents READ recentChangeEvents NOTIFY statusChanged)
+
 public:
     explicit ServerStatusModel(QObject* parent = nullptr);
 
@@ -79,6 +96,9 @@ public:
     QString decodeState() const { return decodeState_; }
     qlonglong framesDecoded() const noexcept { return framesDecoded_; }
 
+    bool changeEventsReachable() const noexcept { return changeEventsReachable_; }
+    QVariantList recentChangeEvents() const { return recentChangeEvents_; }
+
 signals:
     void channelNameChanged();
     void statusChanged();
@@ -89,9 +109,11 @@ private slots:
 private:
     void queryChannelStatus();
     void queryDecodeMetrics();
+    void queryChangeEvents();
 
     static constexpr int kPollIntervalMs = 2000;
     static constexpr int kRequestTimeoutMs = 2000;
+    static constexpr int kMaxDisplayedEvents = 5; // per-pane list is a glance, not a log viewer
     static const char* const kServerBaseUrl;
 
     QString channelName_ = QStringLiteral("test");
@@ -105,6 +127,7 @@ private:
     // finished handler regardless of this pointer).
     QNetworkReply* channelStatusReply_ = nullptr;
     QNetworkReply* decodeMetricsReply_ = nullptr;
+    QNetworkReply* changeEventsReply_ = nullptr;
 
     bool channelStatusReachable_ = false;
     bool mediaMtxReachable_ = false;
@@ -113,4 +136,7 @@ private:
     bool decodeMetricsReachable_ = false;
     QString decodeState_ = QStringLiteral("unknown");
     qlonglong framesDecoded_ = 0;
+
+    bool changeEventsReachable_ = false;
+    QVariantList recentChangeEvents_; // up to kMaxDisplayedEvents entries, newest first
 };

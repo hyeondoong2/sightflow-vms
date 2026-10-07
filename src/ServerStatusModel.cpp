@@ -1,11 +1,16 @@
 #include "ServerStatusModel.h"
 
+#include <algorithm>
+
+#include <QDateTime>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QUrl>
+#include <QVariantMap>
 
 const char* const ServerStatusModel::kServerBaseUrl = "http://127.0.0.1:8080";
 
@@ -37,6 +42,7 @@ void ServerStatusModel::poll()
 {
     queryChannelStatus();
     queryDecodeMetrics();
+    queryChangeEvents();
 }
 
 void ServerStatusModel::queryChannelStatus()
@@ -111,6 +117,56 @@ void ServerStatusModel::queryDecodeMetrics()
         decodeMetricsReachable_ = true;
         decodeState_ = obj.value(QStringLiteral("state")).toString(QStringLiteral("unknown"));
         framesDecoded_ = obj.value(QStringLiteral("framesDecoded")).toInteger();
+        emit statusChanged();
+    });
+}
+
+void ServerStatusModel::queryChangeEvents()
+{
+    if (changeEventsReply_) {
+        return; // previous query still in flight -- never stack up requests
+    }
+
+    QNetworkRequest request(
+        QUrl(QString::fromLatin1(kServerBaseUrl) + QStringLiteral("/channels/") + channelName_ + QStringLiteral("/events")));
+    request.setTransferTimeout(kRequestTimeoutMs);
+
+    changeEventsReply_ = network_->get(request);
+    connect(changeEventsReply_, &QNetworkReply::finished, this, [this]() {
+        QNetworkReply* reply = changeEventsReply_;
+        changeEventsReply_ = nullptr;
+        reply->deleteLater();
+
+        const QVariant httpStatusAttr = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+        QJsonParseError parseError{};
+        const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll(), &parseError);
+
+        if (!httpStatusAttr.isValid() || parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            changeEventsReachable_ = false;
+            recentChangeEvents_.clear();
+            emit statusChanged();
+            return;
+        }
+
+        const QJsonArray events = doc.object().value(QStringLiteral("events")).toArray();
+        changeEventsReachable_ = true;
+
+        recentChangeEvents_.clear();
+        if (!events.isEmpty()) {
+            // Server returns newest-first (ChangeEventLog::recentEvents()).
+            const int shown = std::min(static_cast<int>(events.size()), kMaxDisplayedEvents);
+            recentChangeEvents_.reserve(shown);
+            for (int i = 0; i < shown; ++i) {
+                const QJsonObject eventObj = events.at(i).toObject();
+                const QDateTime eventTime =
+                    QDateTime::fromString(eventObj.value(QStringLiteral("timestamp")).toString(), Qt::ISODateWithMs);
+                QVariantMap entry;
+                entry[QStringLiteral("time")] =
+                    eventTime.isValid() ? eventTime.toLocalTime().toString(QStringLiteral("hh:mm:ss")) : QString();
+                entry[QStringLiteral("ratio")] = eventObj.value(QStringLiteral("changeRatio")).toDouble();
+                recentChangeEvents_.append(entry);
+            }
+        }
         emit statusChanged();
     });
 }
