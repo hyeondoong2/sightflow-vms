@@ -59,7 +59,16 @@ Do not design or implement any of the following as part of Phase 1, even partial
   FFmpeg (no OpenCV, no Qt image plugin, no new dependency). Does not widen
   this exclusion for anything else; no OpenCV dependency, no object/person
   recognition, was added.
-- SQLite or any persistence of events/metadata.
+- SQLite or any persistence of events/metadata. **Exception:** each
+  channel's recent "화면 변화 감지" events and their JPEG snapshots (D22/D23)
+  are now mirrored to a local SQLite database via Qt's own `QtSql` module
+  (already part of this project's Qt kit, no new dependency) so they survive
+  a server restart, at the user's explicit direction ahead of this phase
+  boundary — see D24 in `docs/DECISIONS.md`. Scoped narrowly: only this one
+  bounded, 20-events-per-channel table: no general event-metadata schema, no
+  search/query surface beyond what D22/D23 already expose over HTTP, and no
+  persistence of anything else (frame data, metrics, MediaMTX status all
+  remain in-memory-only, unchanged).
 - REST or WebSocket APIs. **Exception:** `sightflow-server.exe`
   (`GET /channels/<name>`, a MediaMTX status query) was added at the user's
   explicit direction ahead of this phase boundary — see D14 in

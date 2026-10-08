@@ -161,8 +161,14 @@ void ServerStatusModel::queryChangeEvents()
                 const QDateTime eventTime =
                     QDateTime::fromString(eventObj.value(QStringLiteral("timestamp")).toString(), Qt::ISODateWithMs);
                 QVariantMap entry;
+                // "MM/dd hh:mm:ss", not just "hh:mm:ss" (docs/DECISIONS.md
+                // D24): an event the server restored from before this
+                // process started (D24) carries its true original
+                // timestamp, which can be an earlier day -- always showing
+                // the date keeps a restored history entry from reading as
+                // "just happened" after a restart.
                 entry[QStringLiteral("time")] =
-                    eventTime.isValid() ? eventTime.toLocalTime().toString(QStringLiteral("hh:mm:ss")) : QString();
+                    eventTime.isValid() ? eventTime.toLocalTime().toString(QStringLiteral("MM/dd hh:mm:ss")) : QString();
                 entry[QStringLiteral("ratio")] = eventObj.value(QStringLiteral("changeRatio")).toDouble();
                 // Added by D23 -- lets QML offer a per-event snapshot without
                 // guessing an id or re-deriving the server's URL shape itself.

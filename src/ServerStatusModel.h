@@ -75,11 +75,14 @@ class ServerStatusModel : public QObject {
     Q_PROPERTY(bool changeEventsReachable READ changeEventsReachable NOTIFY statusChanged)
 
     // Up to kMaxDisplayedEvents (5) individual recent events, newest first,
-    // each a QVariantMap{"time": QString ("hh:mm:ss", local time),
-    // "ratio": double (0.0-1.0), "id": this event's id within its own
-    // channel (docs/DECISIONS.md D23), "snapshotAvailable": bool (D23) --
-    // true only if a JPEG snapshot of the actual decoded frame at that
-    // moment was captured and can still be fetched from
+    // each a QVariantMap{"time": QString ("MM/dd hh:mm:ss", local time --
+    // always includes the date, not just the time, so an event the server
+    // restored from before this process started (docs/DECISIONS.md D24)
+    // never reads as "just happened"), "ratio": double (0.0-1.0), "id":
+    // this event's id within its own channel (D23, and stable across a
+    // server restart, D24), "snapshotAvailable": bool (D23) -- true only if
+    // a JPEG snapshot of the actual decoded frame at that moment was
+    // captured and can still be fetched from
     // GET /channels/<channelName>/events/<id>/snapshot}. QML reads
     // recentChangeEvents.length for a count and recentChangeEvents[0] for
     // "the last one" rather than separate summary properties, so there is

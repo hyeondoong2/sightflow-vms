@@ -31,8 +31,9 @@ Phase 1 (implementation) has not started.
   exactly two fixed channels, "test"/"test2" (D14/D20 client, D21 server),
   and the server's non-OpenCV "화면 변화 감지" thumbnail comparison (D22)
   plus its per-event id and real-decoded-frame JPEG snapshot
-  capture/retrieval (D23), all added at the user's explicit direction; see
-  `docs/DECISIONS.md`.
+  capture/retrieval (D23) and their persistence to a local SQLite database
+  across a server restart (D24), all added at the user's explicit
+  direction; see `docs/DECISIONS.md`.
 - **Step 0 (environment setup):** Exact toolchain versions (MSVC, CMake, Qt,
   FFmpeg) are **TBD** — not fixed by this documentation. They are to be
   selected and verified at the start of Phase 1 implementation, before any

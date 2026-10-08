@@ -12,13 +12,18 @@ extern "C" {
 #include "AvRaii.h"
 #include "ChangeDetector.h"
 #include "Decoder.h"
+#include "EventStore.h"
 #include "RtspSource.h"
 #include "SnapshotEncoder.h"
 
-DecodeWorker::DecodeWorker(std::string url, DecodeMetrics& metrics, ChangeEventLog& changeEventLog)
+DecodeWorker::DecodeWorker(std::string url, std::string channelName, DecodeMetrics& metrics,
+    ChangeEventLog& changeEventLog, QString dbFilePath, std::size_t eventCapacity)
     : url_(std::move(url))
+    , channelName_(std::move(channelName))
     , metrics_(metrics)
     , changeEventLog_(changeEventLog)
+    , dbFilePath_(std::move(dbFilePath))
+    , eventCapacity_(eventCapacity)
 {
 }
 
@@ -90,6 +95,21 @@ bool DecodeWorker::retryAfterFailure(const std::string& message, int& consecutiv
 
 void DecodeWorker::run()
 {
+    // Opened once for this thread's whole lifetime (independent of how many
+    // times the RTSP session below reconnects) -- never shared with any
+    // other thread (D24: a QtSql connection must be used only from the
+    // thread that created it). A connection name per channel keeps this
+    // distinct from the other channel's DecodeWorker thread's own
+    // connection, and from the one-time startup-load connection main()
+    // already closed before this thread was started.
+    QString eventStoreError;
+    std::unique_ptr<EventStore> eventStore =
+        EventStore::open(QStringLiteral("events-") + QString::fromStdString(channelName_), dbFilePath_, eventStoreError);
+    if (!eventStore) {
+        std::cerr << "DecodeWorker[" << url_ << "]: persistence unavailable (" << eventStoreError.toStdString()
+                   << ") -- this channel's events will not survive a server restart\n";
+    }
+
     int consecutiveFailures = 0;
 
     while (!stopRequested_.load()) {
@@ -196,7 +216,30 @@ void DecodeWorker::run()
                     if (std::optional<std::vector<uint8_t>> encoded = encodeJpegSnapshot(frame.get(), snapshotError)) {
                         snapshotJpeg = std::move(*encoded);
                     }
-                    changeEventLog_.record(*changeRatio, std::move(snapshotJpeg));
+
+                    // record() takes its JPEG argument by value, so passing
+                    // the lvalue `snapshotJpeg` here copies into it (moving
+                    // only that copy into ChangeEventLog's own storage) --
+                    // the original stays valid below for EventStore, which
+                    // needs the same bytes persisted (D24).
+                    const ChangeEvent recorded = changeEventLog_.record(*changeRatio, snapshotJpeg);
+
+                    if (eventStore) {
+                        QString persistError;
+                        if (!eventStore->appendAndPrune(
+                                QString::fromStdString(channelName_), recorded, snapshotJpeg, eventCapacity_, persistError)) {
+                            // Not rate-limited like retryAfterFailure's
+                            // logging: events are already cooldown-limited
+                            // to roughly one per few seconds (D22), so even
+                            // a persistently broken disk cannot flood the
+                            // console here. The event itself is still fully
+                            // usable this run -- it is already in
+                            // changeEventLog_ above; only its survival past
+                            // a restart is lost.
+                            std::cerr << "DecodeWorker[" << url_ << "]: failed to persist event " << recorded.id
+                                       << " (" << persistError.toStdString() << ")\n";
+                        }
+                    }
                 }
 
                 av_frame_unref(frame.get()); // must be clean before the next receiveFrame call

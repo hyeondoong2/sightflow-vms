@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(FFMPEG REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Network)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Network Sql)
 
 qt_standard_project_setup()
 
@@ -67,13 +67,14 @@ qt_add_executable(sightflow-server
     src/server/ChangeEventLog.cpp
     src/server/ChangeEventService.cpp
     src/server/SnapshotEncoder.cpp
+    src/server/EventStore.cpp
     src/RtspSource.cpp
     src/Decoder.cpp
 )
 
 target_include_directories(sightflow-server PRIVATE ${FFMPEG_INCLUDE_DIRS} src src/server)
 target_link_directories(sightflow-server PRIVATE ${FFMPEG_LIBRARY_DIRS})
-target_link_libraries(sightflow-server PRIVATE Qt6::Core Qt6::Network ${FFMPEG_LIBRARIES})
+target_link_libraries(sightflow-server PRIVATE Qt6::Core Qt6::Network Qt6::Sql ${FFMPEG_LIBRARIES})
 
 if(WIN32)
     add_custom_command(TARGET sightflow-server POST_BUILD

@@ -1388,3 +1388,230 @@ above) means a client cannot distinguish a typo'd id from a legitimately
 expired one from the HTTP response alone — accepted, documented, not
 expected to matter for a UI that only ever requests ids it just read from
 `recentEvents()`/`recentChangeEvents`.
+
+---
+
+## D24 — Each channel's recent "화면 변화 감지" events (and their JPEG snapshots) survive a server restart, via a local SQLite database (`EventStore`); `ChangeEventLog` remains the only thing any HTTP response reads at runtime
+
+**Decision:** `sightflow-server.exe` now mirrors each channel's `ChangeEventLog`
+to a local SQLite database file, so `GET /channels/<name>/events` and
+`.../events/<id>/snapshot` keep answering with real history across a
+restart instead of starting empty every time. The in-memory/on-disk split
+is deliberate and one-directional in each steady-state direction:
+
+- **Writes (memory -> disk):** `DecodeWorker` still calls
+  `changeEventLog_.record(ratio, jpeg)` exactly as before (D22/D23) — that
+  call's return type changed from `std::uint64_t` to the full `ChangeEvent`
+  it just stored, so the caller has the *exact* id/timestamp that was
+  recorded, not a value it would otherwise have to recompute. Right after,
+  `DecodeWorker` calls a new `EventStore::appendAndPrune()` with that same
+  `ChangeEvent` (plus the JPEG bytes) to persist it. `ChangeEventLog` itself
+  gained no disk-I/O-performing method and still has zero knowledge SQLite
+  exists.
+- **Reads (disk -> memory, startup only):** A new
+  `ChangeEventLog::restoreFromPersisted(entries)` replaces a freshly
+  constructed log's contents with whatever `EventStore::loadRecent()` found
+  for that channel, and seeds `nextId_` to continue right after the highest
+  restored id. This runs exactly once per channel, on the main thread,
+  before that channel's `DecodeWorker` thread is started — i.e.
+  single-threaded, no lock contention possible.
+- **Runtime HTTP reads never touch SQLite at all.** `ChangeEventService`
+  (D22/D23) is completely unchanged — still only calls
+  `ChangeEventLog::recentEvents()`/`snapshotFor()`, both still pure
+  in-memory, mutex-guarded, non-blocking operations. This is what satisfies
+  "DB 작업을 Qt HTTP 이벤트 루프에서 오래 수행하지 않는다": the Qt
+  event-loop thread's steady-state hot path does zero disk I/O, not "disk
+  I/O that happens to be fast" — the two are structurally disjoint.
+
+**Database choice: SQLite via Qt's own QtSql module, confirmed present
+before committing to it.** Checked directly against this project's actual
+Qt 6.12.0 kit (`C:/Qt/6.12.0/msvc2022_64`) rather than assumed: `Qt6Sql.dll`
+(`lib/cmake/Qt6Sql/*`) and both the release and debug SQLite driver plugins
+(`plugins/sqldrivers/qsqlite.dll`, `qsqlited.dll`) are all present. No new
+third-party dependency, no new vcpkg feature (`vcpkg.json` lists only
+`ffmpeg`; SQLite here comes entirely from the already-installed Qt kit) —
+only an additional Qt component (`Sql`) added to the existing
+`find_package(Qt6 ...)` call and linked into `sightflow-server` only (not
+`sightflow-vms`, which has no need for it).
+
+**Schema.** One table, shared by both channels, row-scoped by a `channel`
+column rather than one table/file per channel (simpler migration-free
+schema for two fixed channels, consistent with D20/D21/D22's
+"two literal channels, not a registry" stance):
+
+```sql
+CREATE TABLE IF NOT EXISTS change_events (
+    channel TEXT NOT NULL,
+    event_id INTEGER NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    change_ratio REAL NOT NULL,
+    snapshot_jpeg BLOB,
+    PRIMARY KEY (channel, event_id)
+)
+```
+`snapshot_jpeg` is written as SQL `NULL` (never an empty blob) whenever
+`ChangeEvent::hasSnapshot` is false, so a restored row's "no snapshot" state
+is unambiguous on the way back in.
+
+**Storage location: `QStandardPaths::AppLocalDataLocation`, computed at
+runtime, never a path literal in source or config.** `main()` calls
+`QCoreApplication::setApplicationName("SightFlowVMS")` and resolves the
+directory from that at startup (`<user>/AppData/Local/SightFlowVMS` on
+Windows), creating it with `QDir().mkpath()` if missing, then appends
+`events.sqlite3`. This satisfies both of the user's explicit constraints:
+outside the repository and outside any CMake build directory (so it
+survives a clean rebuild and a `git clean`), and no machine-specific
+absolute path ever appears in a file this project tracks. **Correction made
+during this entry's own verification:** the first implementation used
+`QStandardPaths::AppDataLocation`, which on Windows actually resolves to the
+**Roaming** profile (`FOLDERID_RoamingAppData`), confirmed empirically by
+running the server and finding the database under
+`AppData/Roaming/SightFlowVMS/` instead of `Local/`. Roaming is meant for
+small, machine-portable user settings (synced across machines in
+managed/domain setups) — a growing binary file with JPEG blobs in it is the
+wrong kind of data to put there. Switched to
+`QStandardPaths::AppLocalDataLocation`, which is documented to map to the
+Local profile specifically, and re-verified: the database now appears under
+`AppData/Local/SightFlowVMS/` as intended. This mistake was caught by
+actually running the server and checking the filesystem, not assumed from
+memory of the two enum values' names.
+
+**Thread/connection ownership (the actual safety argument for "두 DecodeWorker
+가 동시에 이벤트를 만들 때도 안전해야 한다").** Qt's documented rule for
+QtSql is that a `QSqlDatabase` connection must be used only from the thread
+that created it — this is about the underlying driver's own thread-safety,
+not Qt's `QObject` signal/slot thread affinity (`QSqlDatabase` is a plain
+value handle, not a `QObject`). `EventStore` is built around exactly that
+constraint:
+
+- One transient `EventStore` on the **main thread**, opened, used to call
+  `loadRecent()` for both channels, and destroyed — all before either
+  `DecodeWorker` thread starts. No concurrency possible at this point; this
+  is ordinary single-threaded startup code.
+- One long-lived `EventStore` per **`DecodeWorker` thread**, opened at the
+  top of that thread's `run()` (before its retry loop — so it persists
+  across every RTSP reconnect inside that same `run()` call, not reopened
+  per session) and destroyed when `run()` returns (thread exiting, RAII,
+  local variable). Never shared with, or touched by, any other thread.
+- The Qt HTTP event-loop thread never opens or touches any `EventStore` at
+  runtime at all (see "Runtime HTTP reads" above).
+
+Three connections, three distinct names (`"events-startup"`,
+`"events-test"`, `"events-test2"`) in `QSqlDatabase`'s process-wide
+name-keyed registry, all pointed at the same on-disk file. SQLite itself
+supports multiple connections — from different OS threads, even different
+processes — to one file; what makes concurrent *writes* from `test`'s and
+`test2`'s independent `DecodeWorker` threads safe rather than racy is two
+`PRAGMA`s `EventStore::open()` sets on every connection: `journal_mode=WAL`
+(so a reader is never blocked by a writer, and vice versa) and
+`busy_timeout=2000` (so a connection that loses the rare moment-of-contention
+write race waits up to 2s for the other to finish, rather than failing
+outright with `SQLITE_BUSY`). Each `appendAndPrune()` call wraps its
+`INSERT` and its capacity-pruning `DELETE` in one transaction
+(`QSqlDatabase::transaction()`/`commit()`/`rollback()`), so a failure
+partway through can never leave a channel's on-disk row count having
+silently exceeded `capacity` or a half-written event visible to a reader.
+
+**Resilience policy (D24, as required): persistence failing never stops
+RTSP decoding, change detection, or the existing HTTP API.** Every
+`EventStore` method reports failure via a `bool` + `QString`, never throws,
+never crashes the process. The policy enforced at every call site:
+- `EventStore::open()` failing at startup (driver missing, directory not
+  writable, disk full, corrupt file, ...) — logged once to stderr; both
+  channels simply start with an empty in-memory history, exactly as if this
+  feature didn't exist. The server still listens, MediaMTX status and
+  decode-metrics endpoints are completely unaffected (they never depended on
+  this).
+- `EventStore::open()` failing inside a `DecodeWorker`'s `run()` — same:
+  logged once, that thread's `eventStore` stays `nullptr` for its whole
+  lifetime, and every later `if (eventStore) { ... }` check simply skips
+  persisting — the event is still fully recorded in `changeEventLog_` and
+  fully servable over HTTP this run, it just won't survive a restart.
+- `EventStore::appendAndPrune()` failing for one event (e.g. disk fills up
+  mid-run) — logged (channel + event id + the SQL error text) and the loop
+  continues; not rate-limited like `retryAfterFailure`'s connection-failure
+  logging, because events are already cooldown-limited to roughly one per
+  few seconds (D22), so even a persistently broken disk cannot flood the
+  console the way a tight retry loop could.
+No method here is ever allowed to abort/terminate the process, and nothing
+in `DecodeWorker`'s decode/detect loop is gated on persistence succeeding.
+
+**Reason:** Requested directly by the user as the next incremental step
+after D23, with explicit constraints: confirm QtSql/SQLite are actually
+available before committing to them (not assumed); keep `GET
+/channels/<name>/events` and the snapshot route's contracts, and the QML
+selection UI, unchanged; never let database work block the Qt HTTP
+event-loop thread; respect QtSql's per-thread-connection rule; stay safe
+under two `DecodeWorker` threads writing concurrently; keep per-channel
+id-spaces non-colliding across a restart; keep the same capacity bound on
+disk as in memory and measure the actual disk usage; store outside the repo
+and build directory with no personal absolute path in tracked files; and
+document a concrete, consistent failure policy rather than leaving it
+implicit.
+
+**Alternatives considered:** A single shared `QSqlDatabase` connection
+reused across threads with a mutex serializing all access — rejected: this
+is exactly the kind of ad-hoc synchronization Qt's own documentation warns
+against for QtSql specifically (the driver itself isn't guaranteed
+thread-safe even under external locking in every backend), where
+per-thread connections plus SQLite's own WAL/busy_timeout handling is both
+simpler and the officially sanctioned pattern. Routing every persistence
+write through the Qt HTTP thread (e.g. `DecodeWorker` posting a queued
+event to a `QObject` living on the main thread, which does the `INSERT`) —
+rejected as the exact kind of new cross-thread queue/dispatch mechanism the
+project's "don't add a thread/queue before it's needed" rule (D16/D22/D23)
+argues against, for no benefit: `DecodeWorker`'s own thread can simply own
+its own connection directly. One SQLite file per channel instead of one
+shared file with a `channel` column — rejected as needless filesystem
+surface (two files/paths to create, open, and reason about) for a schema
+that a single indexed column already disambiguates cleanly. Persisting
+unbounded history (never pruning on disk) — rejected outright: violates the
+project's no-unbounded-growth rule just as clearly on disk as in memory;
+disk is pruned to the exact same `capacity` as `ChangeEventLog` precisely so
+there is only one bound to reason about, not two.
+
+**Disk usage, measured, not assumed.** With both fixed channels running a
+lightweight synthetic `testsrc` source (320x240) and both at their 20-event
+capacity (40 rows total), the database file size after a `PRAGMA
+wal_checkpoint(TRUNCATE)` (merging the write-ahead log into the main file)
+was **348,160 bytes (~340 KiB)** — individual snapshot blobs measured
+6.2–6.4 KB each in this run, well under the 256 KiB-per-image defensive cap
+`SnapshotEncoder` already enforced (D23). This is comfortably inside the
+worst-case ceiling already documented in D23 (256 KiB × 20 × 2 = 10 MiB) and
+close to the "tens of KiB per image, ~1 MiB total" figure estimated there,
+now confirmed by an actual measurement rather than an estimate. One
+known, accepted characteristic: SQLite does not auto-shrink a file when
+rows are deleted (freed pages are reused for future inserts within the same
+file, but the file's on-disk high-water mark doesn't drop without an
+explicit, unscheduled `VACUUM`, which this feature does not run) — at these
+row counts and blob sizes the absolute numbers stay small regardless, so
+this was accepted rather than adding a periodic compaction mechanism
+nothing here currently needs.
+
+**Trade-offs, and what this entry's own verification could and could not
+exercise.** One extra local-disk write (one `INSERT` + one pruning `DELETE`,
+one transaction) runs on `DecodeWorker`'s own thread each time an event
+fires — bounded to roughly once per `ChangeDetector::kEventCooldown` (a few
+seconds) same as the JPEG encode next to it (D23), not measured against real
+camera footage for exact latency, but SQLite on local disk at this row/blob
+scale is not expected to be a meaningfully-sized addition to that existing
+budget. Verification in this sandboxed environment could exercise the full
+write/read-back/restart/re-query cycle end-to-end repeatedly (including
+confirming id continuity, 20-row pruning enforced in the database itself
+via a direct query — not just inferred from the API's own `LIMIT` — and
+complete channel isolation under a mid-stream drop/reconnect), including a
+restart after an **abrupt** (forceful) process kill, which WAL mode is
+specifically designed to survive without data loss or corruption (confirmed
+— the restart log reported the full persisted count for both channels
+immediately). What this environment's automation could **not** exercise is
+the OS graceful-shutdown signal path itself (`SetConsoleCtrlHandler` →
+`QCoreApplication::quit()` → `aboutToQuit` → `EventStore`'s RAII destructor
+closing its connection cleanly): neither `taskkill` without `/F` nor
+`Process.CloseMainWindow()` produced any effect on a console process
+launched the way this sandbox's automation launches background processes
+(`MainWindowHandle` was consistently `0`, with no window for either
+mechanism to signal). That shutdown *code path* is unchanged, ordinary RAII
+(no new risk introduced by D24 beyond "one more object with a destructor"),
+and the harder case — surviving a hard kill — was verified directly, but a
+reader should not take this entry as having observed the clean-shutdown
+log/behavior firsthand; only the forceful-termination path was.

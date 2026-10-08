@@ -2,9 +2,12 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include <QString>
 
 #include "ChangeEventLog.h"
 #include "DecodeMetrics.h"
@@ -26,10 +29,27 @@
 // deliberately different from CaptureWorker/the client, which still never
 // auto-reconnects (D8, Phase 1 client scope) -- see D17 for why the two are
 // allowed to differ and are not in conflict.
+//
+// Also owns this channel's EventStore connection (D24): opened once at the
+// top of run(), for this thread's whole lifetime (independent of how many
+// times the RTSP session itself reconnects inside that same run() call) --
+// never shared with any other thread. Right after each successful
+// changeEventLog_.record() call, this worker also calls that connection's
+// appendAndPrune() so the event survives a server restart. If persistence is
+// unavailable (EventStore::open() failed, or a later appendAndPrune() call
+// fails), this worker logs it and continues decoding/detecting/serving
+// exactly as before D24 existed -- persistence failing never stops RTSP
+// decoding or change detection (D24's resilience policy).
 class DecodeWorker {
 public:
     // `metrics` and `changeEventLog` must both outlive this DecodeWorker.
-    DecodeWorker(std::string url, DecodeMetrics& metrics, ChangeEventLog& changeEventLog);
+    // `channelName` identifies this channel's own rows in the shared SQLite
+    // database at `dbFilePath` (D24) -- distinct from `url`, which is the
+    // RTSP source, not a storage key. `eventCapacity` must match the
+    // capacity `changeEventLog` was constructed with, so the on-disk and
+    // in-memory bounds for this channel always agree.
+    DecodeWorker(std::string url, std::string channelName, DecodeMetrics& metrics, ChangeEventLog& changeEventLog,
+        QString dbFilePath, std::size_t eventCapacity);
 
     // Requests stop (if running) and joins the worker thread.
     ~DecodeWorker();
@@ -67,13 +87,16 @@ private:
     static constexpr int kLogEveryNFailures = 10; // avoid one log line per retry forever
 
     std::string url_;
+    std::string channelName_;
     DecodeMetrics& metrics_;
     ChangeEventLog& changeEventLog_;
+    QString dbFilePath_;
+    std::size_t eventCapacity_;
     std::atomic<bool> stopRequested_{false};
     std::thread thread_;
 
     // Guards only the interruptible retry-backoff wait -- never held across
-    // FFmpeg or socket I/O.
+    // FFmpeg, socket, or disk I/O.
     std::mutex waitMutex_;
     std::condition_variable waitCv_;
 };

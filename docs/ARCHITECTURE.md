@@ -53,6 +53,19 @@ back via FFmpeg's "mjpeg" decoder plus the existing `FrameConverter`
 list. No image bytes, and no transcoding work, ever cross onto the Qt
 HTTP-handling thread or the Qt UI thread — see D23 for the full design.
 
+**Persistence exception (D24).** Each channel's `ChangeEventLog` (D22/D23)
+is now mirrored to a local SQLite database (`EventStore`, via Qt's `QtSql`
+module) so its recent events and their JPEG snapshots survive a server
+restart. `ChangeEventLog` itself stays exactly what this document already
+describes it as — a bounded, mutex-guarded, in-memory container — and
+remains the *only* thing `ChangeEventService`/the Qt HTTP thread ever reads
+at runtime; `EventStore` is a write-behind mirror `DecodeWorker` writes to
+on its own thread (one SQLite connection per `DecodeWorker` thread, never
+shared), read back only once per channel at startup, before that channel's
+`DecodeWorker` thread exists. See D24 for the full design, the SQLite/QtSql
+availability check, the storage-location decision, and its resilience
+policy when persistence itself fails.
+
 ## 1. Data flow
 
 ```

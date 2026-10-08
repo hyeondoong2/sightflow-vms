@@ -1,6 +1,9 @@
 #include <iostream>
+#include <memory>
 
 #include <QCoreApplication>
+#include <QDir>
+#include <QStandardPaths>
 #include <QUrl>
 
 #ifdef _WIN32
@@ -13,6 +16,7 @@
 #include "DecodeMetrics.h"
 #include "DecodeMetricsService.h"
 #include "DecodeWorker.h"
+#include "EventStore.h"
 #include "HttpServer.h"
 #include "MediaMtxClient.h"
 
@@ -21,15 +25,58 @@ constexpr quint16 kListenPort = 8080;
 const char* kMediaMtxApiBaseUrl = "http://127.0.0.1:9997";
 
 // How many of a channel's most recent "화면 변화 감지" events stay in
-// memory (ChangeEventLog, D22). 20 is enough to show a short recent history
-// per channel without the log growing unbounded; older events are simply
-// dropped, not persisted anywhere.
+// memory (ChangeEventLog, D22) *and* on disk (EventStore, D24) -- the two
+// are always kept at the same bound, so neither can hold history the other
+// doesn't. 20 is enough to show a short recent history per channel without
+// either growing unbounded; older events (and their on-disk rows/snapshot
+// blobs) are simply dropped, not archived anywhere else.
 constexpr std::size_t kChangeEventLogCapacity = 20;
+
+// Loads this channel's persisted events (if any) into `log`, via a
+// transient EventStore connection opened just for this call -- used only
+// here, on the main thread, before any DecodeWorker thread exists (D24).
+// Never fatal: a missing/unreadable store just leaves `log` empty, exactly
+// as if this feature didn't exist.
+void restoreChannelHistory(EventStore* startupStore, const QString& channelName, ChangeEventLog& log)
+{
+    if (!startupStore) {
+        return;
+    }
+    std::vector<ChangeEventLog::PersistedEntry> entries;
+    QString loadError;
+    if (!startupStore->loadRecent(channelName, kChangeEventLogCapacity, entries, loadError)) {
+        std::cerr << "sightflow-server: failed to load persisted events for '" << channelName.toStdString()
+                   << "' (" << loadError.toStdString() << ") -- starting with an empty history for this channel\n";
+        return;
+    }
+    if (!entries.empty()) {
+        std::cout << "sightflow-server: restored " << entries.size() << " persisted event(s) for '"
+                   << channelName.toStdString() << "'\n";
+    }
+    log.restoreFromPersisted(std::move(entries));
 }
+} // namespace
 
 int main(int argc, char* argv[])
 {
     QCoreApplication app(argc, argv);
+
+    // Named so QStandardPaths::AppLocalDataLocation resolves to a stable,
+    // per-user path (e.g. "<user>/AppData/Local/SightFlowVMS" on Windows)
+    // computed at runtime -- never a machine-specific absolute path literal
+    // in source or config (docs/DECISIONS.md D24). Outside both the
+    // repository and any CMake build directory, so it survives a clean
+    // rebuild and isn't picked up by git. Deliberately AppLocalDataLocation,
+    // not the plain AppDataLocation: on Windows the latter maps to the
+    // *Roaming* profile (synced across machines in managed/domain setups),
+    // which is the wrong place for a growing binary SQLite file with JPEG
+    // blobs in it -- AppLocalDataLocation maps to the Local profile
+    // (explicitly excluded from roaming), the conventional home for this
+    // kind of per-machine application data/cache.
+    QCoreApplication::setApplicationName(QStringLiteral("SightFlowVMS"));
+    const QString appDataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    QDir().mkpath(appDataDir); // idempotent; also creates any missing parent directories
+    const QString dbFilePath = appDataDir + QStringLiteral("/events.sqlite3");
 
     MediaMtxClient mediaMtxClient(QUrl(QString::fromLatin1(kMediaMtxApiBaseUrl)));
 
@@ -47,14 +94,40 @@ int main(int argc, char* argv[])
     // detection state ever touches the other's.
     DecodeMetrics decodeMetricsTest;
     ChangeEventLog changeEventLogTest(kChangeEventLogCapacity);
-    DecodeWorker decodeWorkerTest("rtsp://127.0.0.1:8554/test", decodeMetricsTest, changeEventLogTest);
+    DecodeMetrics decodeMetricsTest2;
+    ChangeEventLog changeEventLogTest2(kChangeEventLogCapacity);
+
+    // Startup load (D24): one transient connection on the main thread,
+    // opened, used for both channels, and destroyed here -- strictly before
+    // either DecodeWorker thread (each opening its own connection to the
+    // same file) is started below, so there is no concurrent access to the
+    // database yet at this point. Never fatal: if persistence is
+    // unavailable at all (driver missing, directory not writable, ...),
+    // this logs once and both channels simply start with an empty
+    // in-memory log, exactly like before this feature existed.
+    {
+        QString storeError;
+        std::unique_ptr<EventStore> startupStore =
+            EventStore::open(QStringLiteral("events-startup"), dbFilePath, storeError);
+        if (!startupStore) {
+            std::cerr << "sightflow-server: persistence unavailable (" << storeError.toStdString()
+                       << ") -- continuing with in-memory-only event history for both channels\n";
+        }
+        restoreChannelHistory(startupStore.get(), QStringLiteral("test"), changeEventLogTest);
+        restoreChannelHistory(startupStore.get(), QStringLiteral("test2"), changeEventLogTest2);
+        // `startupStore` destroyed here (end of scope) -- its connection is
+        // closed before DecodeWorkerTest/DecodeWorkerTest2 start and open
+        // their own.
+    }
+
+    DecodeWorker decodeWorkerTest("rtsp://127.0.0.1:8554/test", "test", decodeMetricsTest, changeEventLogTest,
+        dbFilePath, kChangeEventLogCapacity);
     decodeWorkerTest.start();
     DecodeMetricsService decodeMetricsServiceTest(QStringLiteral("test"), decodeMetricsTest);
     ChangeEventService changeEventServiceTest(QStringLiteral("test"), changeEventLogTest);
 
-    DecodeMetrics decodeMetricsTest2;
-    ChangeEventLog changeEventLogTest2(kChangeEventLogCapacity);
-    DecodeWorker decodeWorkerTest2("rtsp://127.0.0.1:8554/test2", decodeMetricsTest2, changeEventLogTest2);
+    DecodeWorker decodeWorkerTest2("rtsp://127.0.0.1:8554/test2", "test2", decodeMetricsTest2, changeEventLogTest2,
+        dbFilePath, kChangeEventLogCapacity);
     decodeWorkerTest2.start();
     DecodeMetricsService decodeMetricsServiceTest2(QStringLiteral("test2"), decodeMetricsTest2);
     ChangeEventService changeEventServiceTest2(QStringLiteral("test2"), changeEventLogTest2);
@@ -68,7 +141,9 @@ int main(int argc, char* argv[])
         // since there are deliberately only two channels to route to
         // (D21/D22). GET /channels/<name> and GET /channels/<name>/metrics
         // keep their existing response contracts unchanged (D14/D16/D17);
-        // GET /channels/<name>/events is new (D22).
+        // GET /channels/<name>/events and its snapshot sub-route (D22/D23)
+        // are unaffected by D24 -- still served entirely from in-memory
+        // ChangeEventLog, never from the database.
         if (path == QStringLiteral("/channels/test/metrics")) {
             decodeMetricsServiceTest.handleRequest(method, path, std::move(respond));
         } else if (path == QStringLiteral("/channels/test2/metrics")) {
@@ -106,10 +181,12 @@ int main(int argc, char* argv[])
     // I/O call if one is in progress (AVIOInterruptCB, same as
     // CaptureWorker §7), or wakes an in-progress retry-backoff wait
     // immediately (D17) if between attempts -- either way it then joins
-    // that worker's thread before the next stop() call begins. Sequential,
-    // not parallel, since each is independently fast (bounded by one
-    // interrupt-callback poll or an immediate condition_variable wake) and
-    // two fixed channels don't warrant added complexity to overlap them.
+    // that worker's thread before the next stop() call begins (this also
+    // closes that thread's own EventStore connection, D24, since it is a
+    // local variable in DecodeWorker::run()). Sequential, not parallel,
+    // since each is independently fast (bounded by one interrupt-callback
+    // poll or an immediate condition_variable wake) and two fixed channels
+    // don't warrant added complexity to overlap them.
     QObject::connect(&app, &QCoreApplication::aboutToQuit,
         [&httpServer, &mediaMtxClient, &decodeWorkerTest, &decodeWorkerTest2]() {
             httpServer.shutdown();
