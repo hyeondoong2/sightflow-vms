@@ -15,15 +15,17 @@ extern "C" {
 #include "EventStore.h"
 #include "RtspSource.h"
 #include "SnapshotEncoder.h"
+#include "WebSocketNotifier.h"
 
 DecodeWorker::DecodeWorker(std::string url, std::string channelName, DecodeMetrics& metrics,
-    ChangeEventLog& changeEventLog, QString dbFilePath, std::size_t eventCapacity)
+    ChangeEventLog& changeEventLog, QString dbFilePath, std::size_t eventCapacity, WebSocketNotifier& wsNotifier)
     : url_(std::move(url))
     , channelName_(std::move(channelName))
     , metrics_(metrics)
     , changeEventLog_(changeEventLog)
     , dbFilePath_(std::move(dbFilePath))
     , eventCapacity_(eventCapacity)
+    , wsNotifier_(wsNotifier)
 {
 }
 
@@ -239,6 +241,26 @@ void DecodeWorker::run()
                             std::cerr << "DecodeWorker[" << url_ << "]: failed to persist event " << recorded.id
                                        << " (" << persistError.toStdString() << ")\n";
                         }
+                    }
+
+                    // Zero-payload "go check channel X now" doorbell (D25)
+                    // -- never touches a socket, never carries the event
+                    // data itself; wsNotifier_ re-reads changeEventLog_
+                    // (already updated above) on its own thread once the
+                    // resulting queued call is processed. Safe to call
+                    // unconditionally and every time an event fires:
+                    // requestNotifyTestChanged()/requestNotifyTest2Changed()
+                    // themselves enforce "at most one outstanding queued
+                    // call per channel" via a plain atomic flag (safe to
+                    // touch directly from this thread, no Qt meta-object
+                    // machinery or socket involved) -- see WebSocketNotifier.h
+                    // for why that bound is a separate concern from the
+                    // dedupe-by-last-broadcast-id check inside
+                    // notifyChannelChanged().
+                    if (channelName_ == "test") {
+                        wsNotifier_.requestNotifyTestChanged();
+                    } else {
+                        wsNotifier_.requestNotifyTest2Changed();
                     }
                 }
 

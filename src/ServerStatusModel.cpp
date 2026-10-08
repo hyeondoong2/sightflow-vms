@@ -11,8 +11,13 @@
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QVariantMap>
+#include <QWebSocket>
 
 const char* const ServerStatusModel::kServerBaseUrl = "http://127.0.0.1:8080";
+// Separate port from kServerBaseUrl's REST API (docs/DECISIONS.md D25) --
+// sightflow-server.exe's QWebSocketServer owns its own listen socket and
+// handshake, distinct from the hand-rolled HTTP server on 8080.
+const char* const ServerStatusModel::kWebSocketBaseUrl = "ws://127.0.0.1:8081";
 
 ServerStatusModel::ServerStatusModel(QObject* parent)
     : QObject(parent)
@@ -24,9 +29,11 @@ ServerStatusModel::ServerStatusModel(QObject* parent)
     // Deferred, not called synchronously here: QML assigns declared
     // properties (including channelName) right after construction, before
     // control returns to the event loop -- a 0ms singleShot runs after
-    // that, so this instance's first poll already uses the channel QML
-    // actually declared, not channelName_'s default.
+    // that, so this instance's first poll (and first WebSocket connect
+    // attempt, D25) already uses the channel QML actually declared, not
+    // channelName_'s default.
     QTimer::singleShot(0, this, &ServerStatusModel::poll);
+    QTimer::singleShot(0, this, &ServerStatusModel::connectWebSocket);
 }
 
 void ServerStatusModel::setChannelName(const QString& name)
@@ -180,4 +187,82 @@ void ServerStatusModel::queryChangeEvents()
         }
         emit statusChanged();
     });
+}
+
+void ServerStatusModel::connectWebSocket()
+{
+    if (webSocket_) {
+        return; // a previous attempt is still connecting, or already connected
+    }
+
+    webSocket_ = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
+    connect(webSocket_, &QWebSocket::connected, this, &ServerStatusModel::onWebSocketConnected);
+    connect(webSocket_, &QWebSocket::disconnected, this, &ServerStatusModel::onWebSocketDisconnected);
+    connect(webSocket_, &QWebSocket::textMessageReceived, this, &ServerStatusModel::onWebSocketTextMessageReceived);
+    connect(webSocket_, &QWebSocket::errorOccurred, this, &ServerStatusModel::onWebSocketError);
+
+    const QUrl url(QString::fromLatin1(kWebSocketBaseUrl) + QStringLiteral("/channels/") + channelName_);
+    webSocket_->open(url);
+}
+
+void ServerStatusModel::onWebSocketConnected()
+{
+    wsConnected_ = true;
+    emit statusChanged();
+}
+
+void ServerStatusModel::onWebSocketError(QAbstractSocket::SocketError /*error*/)
+{
+    // No separate handling: a connection attempt that fails before ever
+    // completing the WebSocket handshake still reaches disconnected()
+    // shortly after this (Qt's documented behavior for QAbstractSocket-
+    // derived classes), which already does the one thing that matters here
+    // -- clear webSocket_ and schedule a retry. This slot only exists so the
+    // error is observed (avoiding Qt's "unhandled signal" nothing-happens
+    // silence) rather than to do its own cleanup.
+}
+
+void ServerStatusModel::onWebSocketDisconnected()
+{
+    if (!webSocket_) {
+        return; // already handled (e.g. errorOccurred's disconnected already ran this once)
+    }
+    wsConnected_ = false;
+    emit statusChanged();
+
+    webSocket_->deleteLater();
+    webSocket_ = nullptr;
+
+    // The independent kPollIntervalMs REST poll (queryChangeEvents(), still
+    // running on its own timer this whole time) is what keeps the UI
+    // correct while this is down -- reconnecting promptly here only
+    // improves latency, it is never required for correctness (D25).
+    QTimer::singleShot(kWsReconnectIntervalMs, this, &ServerStatusModel::connectWebSocket);
+}
+
+void ServerStatusModel::onWebSocketTextMessageReceived(const QString& message)
+{
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(message.toUtf8(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return; // malformed -- ignore; the next periodic poll will still catch up regardless
+    }
+
+    const QJsonObject obj = doc.object();
+    if (obj.value(QStringLiteral("channel")).toString() != channelName_) {
+        // Defensive only -- sightflow-server already scopes this WebSocket
+        // connection to this channel via its own request path
+        // ("/channels/<channelName>", D25), so this should never actually
+        // differ; never trust a network input blindly regardless.
+        return;
+    }
+
+    // A push notification only ever means "go re-fetch the event list" --
+    // it carries no snapshot/image data itself (D25) and is never treated
+    // as the event list's own source of truth. queryChangeEvents() re-reads
+    // the exact same REST endpoint the periodic poll already uses, so the
+    // existing D24 "MM/dd hh:mm:ss" display and every other handling
+    // applies identically regardless of what triggered this particular
+    // fetch.
+    queryChangeEvents();
 }

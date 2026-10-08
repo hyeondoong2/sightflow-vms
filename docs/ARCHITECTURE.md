@@ -66,6 +66,26 @@ shared), read back only once per channel at startup, before that channel's
 availability check, the storage-location decision, and its resilience
 policy when persistence itself fails.
 
+**Push-notification exception (D25).** `sightflow-server.exe` also runs a
+`QWebSocketServer` (`WebSocketNotifier`, port 8081, separate from the REST
+API's port 8080) that pushes a small `{channel, id, changeRatio,
+snapshotAvailable}` message to connected clients the moment either
+channel's `DecodeWorker` records a new event -- never the JPEG itself.
+`DecodeWorker` still never touches a socket: it reaches `WebSocketNotifier`
+(a `QObject` living entirely on the Qt event-loop thread) only via a single
+zero-payload `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` call per
+event, which re-reads that channel's already-thread-safe `ChangeEventLog`
+(D22) on the Qt thread rather than carrying any data across the boundary
+itself. `sightflow-vms.exe`'s `ServerStatusModel` holds one `QWebSocket` per
+channel instance, scoped to that channel's own path
+(`ws://127.0.0.1:8081/channels/<name>`); a notification only ever triggers
+the exact same REST re-fetch the existing periodic poll already performs,
+which keeps running unmodified as the sole thing correctness depends on --
+the WebSocket is strictly a latency optimization on top of it, in every
+sense (including when entirely unavailable). See D25 for the full design,
+the QtWebSockets availability check, the explicit bound on pending
+notifications, and the port/path relationship to the existing HTTP API.
+
 ## 1. Data flow
 
 ```

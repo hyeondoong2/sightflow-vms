@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QAbstractSocket>
 #include <QObject>
 #include <QQmlEngine>
 #include <QString>
@@ -8,6 +9,7 @@
 
 class QNetworkAccessManager;
 class QNetworkReply;
+class QWebSocket;
 
 // Periodically polls sightflow-server.exe's three read-only status
 // endpoints for one channel -- GET /channels/<channelName>, GET
@@ -34,6 +36,18 @@ class QNetworkReply;
 // thread, and no queue with it. If sightflow-server.exe is unreachable, the
 // *Reachable properties below go false and the video path is completely
 // unaffected -- see docs/DECISIONS.md D18.
+//
+// Also owns a WebSocket connection to sightflow-server.exe's push-
+// notification listener (docs/DECISIONS.md D25), scoped to this instance's
+// own channel path (ws://127.0.0.1:8081/channels/<channelName>) -- a
+// notification only ever means "re-fetch this channel's event list now"
+// (queryChangeEvents(), the exact same REST call the periodic poll above
+// already makes); it never carries snapshot/image data itself. This is
+// purely a latency improvement layered on top of the periodic poll, never a
+// replacement for it: the kPollIntervalMs timer above keeps running
+// completely unchanged and independently, so the UI still refreshes on its
+// own even if the WebSocket never connects at all, drops mid-session, or
+// the server was built/run without it -- see D25 for the reconnect policy.
 //
 // Every property pair below is deliberately split into "did this query
 // reach the server at all" vs. "what did it say", because a request that
@@ -89,6 +103,15 @@ class ServerStatusModel : public QObject {
     // exactly one source of truth for this data.
     Q_PROPERTY(QVariantList recentChangeEvents READ recentChangeEvents NOTIFY statusChanged)
 
+    // True only while the push-notification WebSocket (D25) is actually
+    // connected. Purely informational -- nothing reads this to decide
+    // whether to trust recentChangeEvents; that is still governed solely by
+    // changeEventsReachable above, which reflects the independent REST poll.
+    // A false value just means updates to this channel's event list will
+    // only arrive on the next periodic poll (at most kPollIntervalMs late),
+    // not that anything is stale or wrong.
+    Q_PROPERTY(bool wsConnected READ wsConnected NOTIFY statusChanged)
+
 public:
     explicit ServerStatusModel(QObject* parent = nullptr);
 
@@ -106,12 +129,19 @@ public:
     bool changeEventsReachable() const noexcept { return changeEventsReachable_; }
     QVariantList recentChangeEvents() const { return recentChangeEvents_; }
 
+    bool wsConnected() const noexcept { return wsConnected_; }
+
 signals:
     void channelNameChanged();
     void statusChanged();
 
 private slots:
     void poll();
+    void connectWebSocket();
+    void onWebSocketConnected();
+    void onWebSocketDisconnected();
+    void onWebSocketTextMessageReceived(const QString& message);
+    void onWebSocketError(QAbstractSocket::SocketError error);
 
 private:
     void queryChannelStatus();
@@ -121,7 +151,13 @@ private:
     static constexpr int kPollIntervalMs = 2000;
     static constexpr int kRequestTimeoutMs = 2000;
     static constexpr int kMaxDisplayedEvents = 5; // per-pane list is a glance, not a log viewer
+    // Fixed-interval retry, same shape as DecodeWorker's own reconnect
+    // backoff (D17/D19) -- not exponential/jittered, a simple constant
+    // delay is enough for this scope. Independent of, and much less
+    // critical than, the existing kPollIntervalMs REST poll -- see D25.
+    static constexpr int kWsReconnectIntervalMs = 3000;
     static const char* const kServerBaseUrl;
+    static const char* const kWebSocketBaseUrl;
 
     QString channelName_ = QStringLiteral("test");
 
@@ -146,4 +182,12 @@ private:
 
     bool changeEventsReachable_ = false;
     QVariantList recentChangeEvents_; // up to kMaxDisplayedEvents entries, newest first
+
+    // Owned (parent = this); recreated on every (re)connect attempt rather
+    // than reused across attempts, so a previous attempt's half-open state
+    // can never bleed into the next one -- null between attempts (while
+    // waiting out kWsReconnectIntervalMs) and while none has ever been made
+    // yet (D25).
+    QWebSocket* webSocket_ = nullptr;
+    bool wsConnected_ = false;
 };

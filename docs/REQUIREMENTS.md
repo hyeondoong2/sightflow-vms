@@ -72,8 +72,13 @@ Do not design or implement any of the following as part of Phase 1, even partial
 - REST or WebSocket APIs. **Exception:** `sightflow-server.exe`
   (`GET /channels/<name>`, a MediaMTX status query) was added at the user's
   explicit direction ahead of this phase boundary — see D14 in
-  `docs/DECISIONS.md`. It does not widen this exclusion for anything else;
-  no other REST/WebSocket surface is in scope.
+  `docs/DECISIONS.md`. D25 adds one further, narrow exception: a WebSocket
+  push notification (`ws://127.0.0.1:8081/channels/<name>`, channel/id/
+  ratio/snapshot-availability only, never image bytes) telling a connected
+  client when to re-fetch D22/D23's existing REST event list sooner than
+  its periodic poll would. Neither widens this exclusion beyond these
+  specific, additive endpoints; no other REST/WebSocket surface is in
+  scope, and every existing REST contract is unchanged by D25.
 - MCP integration.
 - Recording/export of video to disk.
 - Authentication, user accounts, multi-user access.

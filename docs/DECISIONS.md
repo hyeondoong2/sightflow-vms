@@ -1615,3 +1615,368 @@ mechanism to signal). That shutdown *code path* is unchanged, ordinary RAII
 and the harder case — surviving a hard kill — was verified directly, but a
 reader should not take this entry as having observed the clean-shutdown
 log/behavior firsthand; only the forceful-termination path was.
+
+**Addendum: the graceful-shutdown path this entry couldn't exercise was
+confirmed separately by the user**, running the real server directly in a
+PowerShell window (not this sandbox's background-process automation) and
+stopping it with Ctrl+C, then restarting it on the same port 8080 -- both
+channels' 20 persisted events were restored, matching this entry's
+hard-kill-path verification. The gap this entry flagged was specific to
+this sandboxed environment's inability to deliver a console-close signal to
+a backgrounded process, not a real limitation of the shutdown code itself.
+
+---
+
+## D25 — Per-channel WebSocket push notification when a new "화면 변화 감지" event is recorded, so a running Qt client re-fetches that channel's event list (REST, unchanged) without waiting for its next poll
+
+**Decision:** `sightflow-server.exe` now pushes a small WebSocket message
+the moment either channel's `DecodeWorker` records a new change-detection
+event, so `sightflow-vms.exe` can refresh that channel's event list sooner
+than its existing 2-second periodic REST poll (D18) would. This is
+additive only: every existing REST contract (`GET /channels/<name>`,
+`.../metrics`, `.../events`, `.../events/<id>/snapshot`) is byte-for-byte
+unchanged, and the periodic poll keeps running, unmodified, as the
+always-available fallback.
+
+**Qt WebSockets availability, checked before committing to it, exactly as
+done for QtSql/D24.** This project's Qt 6.12.0 kit did **not** have the
+`QtWebSockets` module installed when first checked (no `Qt6WebSockets`
+cmake package, `.lib`, `.dll`, or header -- only leftover translation
+files from the base install). Implementation was not started at that
+point; the finding was reported to the user, who installed the module via
+Qt's own Maintenance Tool (`Qt 6.12.0 > MSVC 2022 64-bit > Qt WebSockets`).
+Re-checked after installation: `Qt6WebSockets.dll`/`Qt6WebSocketsd.dll`,
+the cmake package, and the headers are all present. No vcpkg dependency
+was considered for this (vcpkg's `qtwebsockets` port would rebuild an
+entire separate Qt6 from source, for a different version/ABI than this
+project's system-installed Qt 6.12.0 kit -- a link-compatibility risk, not
+a practical option here, same reasoning D24 already applied when it
+rejected vcpkg's Qt ports for the same reason).
+
+**Why a separate port (8081), not multiplexed onto the existing HTTP port
+(8080).** `QWebSocketServer` owns its own listen socket and performs its
+own HTTP Upgrade handshake internally; it cannot share a listening socket
+with `HttpServer`/`ClientConnection`'s hand-rolled, GET-only HTTP/1.1
+parser (D14) without teaching that minimal parser to recognize and hand off
+an `Upgrade: websocket` request -- deliberately not done, to keep
+`ClientConnection`'s "exactly one minimal HTTP request per connection"
+model unchanged. Both ports are plain, unauthenticated, `127.0.0.1`-only
+sockets -- the same trust boundary the REST API already has. No auth
+key/token exists anywhere in this project to need keeping out of source
+control, and D25 adds none. A client reaches channel "test"'s notifications
+at `ws://127.0.0.1:8081/channels/test` ("test2" the same way) -- the path
+is how `WebSocketNotifier` routes a connection to the right channel's
+client bucket, mirroring the REST API's own `/channels/<name>/...` path
+shape for familiarity, even though the two servers share no code.
+
+**Thread boundary: `DecodeWorker` never touches a socket.** `WebSocketNotifier`
+(new, `src/server/WebSocketNotifier.{h,cpp}`) is a `QObject` living
+entirely on the Qt event-loop thread -- the listen socket, every accepted
+`QWebSocket`, and all send/receive/close handling live there and nowhere
+else. `DecodeWorker` (a plain `std::thread`, not a `QObject`) only ever
+calls `QMetaObject::invokeMethod(&wsNotifier_, &WebSocketNotifier::
+notifyTestChanged` (or `notifyTest2Changed`), `Qt::QueuedConnection)` right
+after `changeEventLog_.record()` -- the Qt-sanctioned way to safely reach a
+`QObject` that lives on a different thread. That queued call carries **no
+payload at all**, not even the channel name (two distinct zero-argument
+methods, one per fixed channel, mirror D20-D24's literal-duplication style
+rather than a generic dispatcher) -- it is purely a "go check channel X
+now" doorbell. The actual event data broadcast is read back out of that
+channel's own already-thread-safe `ChangeEventLog::recentEvents()` (D22) at
+the moment `WebSocketNotifier`'s own thread processes the call, never
+anything `DecodeWorker` constructed or passed across the boundary.
+
+**Explicit bound on pending notifications -- two separate bounds, not one
+(corrected; see the "Bug found" note below).** There are two independent
+things that needed an explicit cap, and they are enforced by two different
+mechanisms:
+
+1. **How many queued `notifyTestChanged()`/`notifyTest2Changed()` calls can
+   be outstanding in Qt's own internal event queue for one channel at a
+   time: at most one**, enforced by `testNotifyPending_`/
+   `test2NotifyPending_` (a plain `std::atomic<bool>`, one per channel).
+   `requestNotifyTestChanged()`/`requestNotifyTest2Changed()` -- the only
+   entry points `DecodeWorker` now calls, safe to call directly from its
+   own thread since they touch only this atomic, never Qt's meta-object
+   system or a socket -- claim it with `exchange(true)` before posting the
+   `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` call, and post
+   nothing if it was already claimed. `notifyTestChanged()`/
+   `notifyTest2Changed()` clear it as the very first thing they do, before
+   reading `ChangeEventLog` -- clearing first, not last, means a
+   `DecodeWorker` call racing in right after the clear always sees `false`
+   and correctly claims+posts a fresh call, so this can only ever produce
+   one harmless *extra* queued call, never a missed one (the actual event
+   data such a race might "miss" is still picked up, because every
+   processed call re-reads `ChangeEventLog`'s *current* newest id, not a
+   value frozen at post time).
+2. **How many broadcast messages can sit unsent in one client's own
+   `QWebSocket` write buffer: capped at `kMaxBufferedBytesPerClient`**
+   (64 KiB). `notifyChannelChanged()` checks `QWebSocket::bytesToWrite()`
+   right after each `sendTextMessage()` call and closes (then the existing
+   per-socket `disconnected` cleanup removes) any client over the limit --
+   logged once per drop (`WebSocketNotifier: dropping a client on channel
+   '<name>' that fell behind reading (<N> bytes still buffered)`) so an
+   operator can tell this happened and why.
+
+The dedupe check against `lastBroadcastIdTest_`/`lastBroadcastIdTest2_`
+(unchanged) is a *third*, separate thing: it only prevents sending a
+*duplicate* WebSocket message for an event already broadcast, and only ever
+runs once a queued call is actually being processed -- by itself it does
+nothing to bound how many such calls (or how much per-client buffered data)
+can accumulate *before* that happens, which is exactly why (1) and (2) above
+exist as their own, independently-enforced bounds.
+
+**Bug found and fixed while reviewing this entry, the same day it was
+written -- same pattern as D13/D21/D22's "verify, don't just reason."**
+This entry's first version claimed "There is no notification queue of our
+own to overflow" and treated the dedupe-by-last-broadcast-id check alone as
+the enforced bound. On review (prompted by the user asking specifically
+whether pending calls could accumulate while the Qt event loop is merely
+delayed, not stalled forever), this was confirmed false by reading the
+actual code: `DecodeWorker` posted a `QMetaObject::invokeMethod(...,
+Qt::QueuedConnection)` call unconditionally, once per recorded event, with
+no check for whether a previous call for that channel was already
+outstanding. The dedupe check only ran *after* a queued call was dequeued
+and executing -- it did nothing to stop a second, third, or Nth queued call
+from being posted while the first was still sitting in Qt's internal event
+queue. Under a sustained Qt-thread delay (not even a full stall -- merely
+"busier than the ~3s `ChangeDetector::kEventCooldown` gap between events"),
+the number of outstanding `QMetaCallEvent`s for one channel would have grown
+for as long as the delay lasted, with no code-level ceiling -- exactly the
+unbounded-queue shape this project's rules forbid, just hiding in Qt's own
+internal queue instead of a container this code declared itself. Separately,
+the same review found `notifyChannelChanged()`'s broadcast loop called
+`QWebSocket::sendTextMessage()` with no check of the socket's own unsent-data
+backlog at all -- a client that connected but never read would have let that
+backlog grow for as long as it stayed connected, also with no code-level
+ceiling. Both were fixed as described above (`requestNotifyTestChanged()`/
+`requestNotifyTest2Changed()`'s atomic claim; `kMaxBufferedBytesPerClient`'s
+check-and-drop), and the pending-call fix was verified to still deliver
+every event correctly (see Test results below) -- coalescing away an
+intermediate event's own dedicated broadcast message under rapid, repeated
+notification requests is the same already-accepted, already-documented
+trade-off this entry's "Alternatives considered" section discusses below,
+not a new one introduced by this fix.
+
+**`WebSocketNotifier`'s per-channel state (D20-D24's two-literal-channels
+style, adapted to one shared listen socket):** one `QWebSocketServer`
+(can't have two listen sockets on one port), but two separate connected-
+client lists (`testClients_`/`test2Clients_`) and two separate dedupe ids
+-- a connecting client's request path decides which bucket it joins;
+`QWebSocketServer` completes the handshake before this class can inspect
+the path (no way to reject the Upgrade itself based on it), so an
+unrecognized path is simply closed again immediately after being accepted.
+Teardown (`shutdown()`) mirrors `HttpServer::shutdown()`'s discipline
+exactly (D15): snapshot-and-clear each client list before touching any
+socket (a synchronous `close()` can re-enter the `disconnected` lambda,
+which would otherwise mutate the list mid-iteration), then
+`disconnect()` → `close()` → `deleteLater()` per client, never a direct
+`delete` from inside a signal handler.
+
+**Notification payload: small, structured, never the image.** `{"channel":
+"test", "id": 42, "changeRatio": 0.043, "snapshotAvailable": true}` --
+channel and id (the user's explicit minimum) plus two already-known,
+already-small fields read straight out of the same `ChangeEvent` struct
+`ChangeEventService` already serializes a superset of for `GET
+/channels/<name>/events` (D22/D23). No JPEG byte ever crosses this
+WebSocket; the final event-list and snapshot lookups stay entirely on the
+existing REST routes, unchanged, exactly as required.
+
+**Client (`ServerStatusModel`, `sightflow-vms.exe`): one `QWebSocket` per
+channel instance, scoped to that channel's own path.** Mirrors the
+existing per-channel, fully-independent design this class already has for
+its three REST polls (D18/D21) -- no shared/coordinator object across the
+two panes. Connects (deferred via the same `QTimer::singleShot(0, ...)`
+pattern already used for the first REST poll, so it waits for QML to
+finish assigning `channelName` first) to
+`ws://127.0.0.1:8081/channels/<channelName>`. On `textMessageReceived`,
+after a defensive channel-name check (the server already scopes the
+connection by path; this is belt-and-suspenders, never trusting network
+input blindly), it calls the exact same private `queryChangeEvents()` the
+periodic poll already calls -- no second code path, no special "pushed"
+state, so D24's "MM/dd hh:mm:ss" display and every other existing handling
+applies identically regardless of what triggered a given fetch.
+
+**Reconnect policy -- fixed interval, same shape as `DecodeWorker`'s own
+(D17/D19), and explicitly never required for correctness.** On
+`disconnected` (or `errorOccurred`, which reaches the same handler), the
+socket is torn down (`deleteLater()`, `webSocket_` set to `nullptr`) and a
+`QTimer::singleShot(kWsReconnectIntervalMs` (3000ms) `, this, &ServerStatusModel::
+connectWebSocket)` schedules the next attempt -- not exponential/jittered,
+a simple constant delay is enough for this scope, matching D17/D19's own
+reasoning for the same shape server-side. Crucially, **the existing
+`kPollIntervalMs` (2000ms) REST poll keeps running throughout, completely
+unmodified and unaware the WebSocket exists at all** -- it is what actually
+guarantees the UI stays correct whether the WebSocket never connects once
+(e.g. built against an older server binary, or `WebSocketNotifier::listen()`
+failed server-side), drops mid-session, or the server restarts. A new
+`wsConnected` property surfaces the live connection state for visibility
+(mirrors the project's established `*Reachable` pattern), but nothing reads
+it to decide whether to trust `recentChangeEvents` -- that is still governed
+solely by `changeEventsReachable`, unaffected by this entry.
+
+**Resilience policy, same shape as D24's for persistence.** `WebSocketNotifier::
+listen()` failing (port in use, etc.) is logged, never fatal:
+`sightflow-server.exe` keeps serving HTTP/RTSP/decode exactly as before;
+`DecodeWorker`'s `wsNotifier_` reference is always valid regardless (unlike
+`EventStore`, there is no nullable "unavailable" state to check at each call
+site -- broadcasting to zero connected clients, which is all that can ever
+happen if `listen()` failed, is already a harmless no-op by construction,
+so no extra branching was needed). Client-side, a WebSocket that never
+connects just means `wsConnected` stays `false` forever while the retry
+loop quietly keeps trying every `kWsReconnectIntervalMs` in the
+background -- no user-visible error, no crash, full functionality via REST
+polling throughout.
+
+**Reason:** Requested directly by the user as the next incremental step
+after D24, with explicit constraints: confirm `QtWebSockets` is actually
+available before committing to it (not assumed, same discipline D24 used
+for QtSql); notify only, never carry the JPEG; keep every existing REST
+contract unchanged; keep `DecodeWorker` off sockets entirely, with an
+explicit, stated bound on anything that could be called "pending
+notifications"; keep channels' notifications fully isolated from each
+other; and make the client's existing periodic REST poll the sole thing
+correctness depends on, with the WebSocket strictly a latency optimization
+layered on top, including when it is entirely unavailable.
+
+**Alternatives considered:** A single shared `QWebSocket`/connection per
+client process instead of one per `ServerStatusModel` instance (so one pane
+notifies the other's model internally) -- rejected as exactly the kind of
+shared-coordinator object this project's two-independent-panes style
+(D18/D20/D21) has consistently avoided elsewhere, for a cost (one extra
+idle TCP connection per pane) too small to justify the added coupling.
+Passing the channel name (or the full event payload) as a captured
+argument in the `QMetaObject::invokeMethod` call instead of a zero-argument
+doorbell -- rejected: re-reading `ChangeEventLog` on the Qt thread is
+already free (same mutex-guarded copy `ChangeEventService` already does)
+and avoids any question of whether a captured-argument queued call counts
+as "payload" against the project's no-unbounded-queue rule; a truly
+zero-payload call sidesteps the question entirely rather than arguing it's
+fine. A bounded queue of individual pending event ids (capacity N,
+drop-oldest) instead of the dedupe-by-last-broadcast-id check plus the
+pending-call atomic claim (both described above) -- rejected as needless:
+the client only ever needs "something changed, go re-fetch", never a
+history of exactly which events triggered a given wake-up, so coalescing to
+two small comparisons (one atomic exchange, one id compare) is both simpler
+and a better fit for the actual use case than a growable (even if
+capacity-bounded) container would be.
+
+**Test results, this session.** Verified end-to-end with a real build (VS2022
+Debug preset, both executables) and a real running server/client, plus a
+raw `curl`-as-WebSocket-client (confirmed this machine's curl 8.15.0
+supports the `ws://` scheme) to observe exact wire messages independent of
+the Qt client:
+- `curl -v --include -N ws://127.0.0.1:8081/channels/test` completed a real
+  `HTTP/1.1 101 Switching Protocols` handshake against the running server.
+- With lightweight `testsrc` streams (not `mandelbrot`, to keep this
+  sandbox's CPU usage low) on both channels, a `curl`-as-listener on each
+  channel's path received a clean, strictly-increasing, never-duplicated
+  sequence of `{"channel", "id", "changeRatio", "snapshotAvailable"}`
+  messages (e.g. `test`: ids 76-81 in order; `test2`, connected
+  simultaneously: ids 112-117 in order, on a completely independent
+  sequence) -- confirming channel isolation and the dedupe/no-duplicate
+  property at the wire level, not just by code review.
+- Stopping `test2`'s publisher produced exactly one more notification (the
+  frame already in flight when the process was killed) and then silence on
+  `test2`'s WebSocket for the rest of the outage, while `test`'s WebSocket
+  kept receiving notifications on its own unaffected schedule the entire
+  time -- restarting `test2` resumed notifications from the next id with no
+  gap-filling and no collision with ids already used (same id-continuity
+  guarantee D24 already established at the storage layer, now also
+  confirmed at the notification layer).
+- Swapping `test`'s source to a literally static color feed produced zero
+  WebSocket messages on `test`'s connection over a 15s window, confirming
+  no spurious notifications for a scene with nothing to report.
+- Server restart (forceful kill + relaunch, same sandbox limitation D24
+  already documented for the graceful-shutdown path): both the REST API and
+  the WebSocket listener came back automatically; the already-running Qt
+  client's own `ServerStatusModel` instances reconnected their WebSockets
+  without any user action (observed via `Get-NetTCPConnection` showing two
+  fresh `Established` connections to port 8081 within seconds of the server
+  coming back up), and the on-screen event lists resumed updating.
+- Forcing `WebSocketNotifier::listen()` to fail (occupying port 8081 with a
+  throwaway listener before starting the server) left `GET /channels/<name>/*`
+  fully functional throughout, confirmed with 20 sequential successful HTTP
+  requests; separately, occupying only the IPv4 loopback (leaving the
+  server's own dual-stack bind on IPv6 intact, an artifact of how
+  `QHostAddress::Any` bound on this machine) reproduced "the client's
+  WebSocket specifically cannot connect" -- the on-screen event lists for
+  both channels kept updating correctly the entire time via the unmodified
+  periodic REST poll, with `wsConnected` never going true.
+- A `curl`-as-client WebSocket connection left open but never read from
+  ("연결만 유지하는 클라이언트") was held for the duration of 20 sequential
+  HTTP requests to `GET /channels/test/metrics` (all `200`, ~75ms/request,
+  ordinary sequential-`curl` overhead) and the whole time `framesDecoded`
+  on both channels kept climbing -- an idle/non-reading WebSocket client
+  measurably did not block other HTTP requests or decoding. A true
+  slow-reader scenario (TCP receive window closed, server send buffer
+  filling) was not separately reproduced -- see Trade-offs.
+- Existing `GET /channels/<name>/events`, `.../events/<id>/snapshot`
+  (a fetched snapshot was confirmed a valid JPEG), unknown-id 404 handling,
+  `GET /channels/<name>`, `.../metrics`, and the D24 restore-on-startup log
+  line ("restored 20 persisted event(s)...") were all re-checked after
+  every restart in this session and showed no regression.
+
+**Test results, follow-up review session (the two bound fixes above).**
+Also a real build/run, not reasoning alone:
+- Temporarily lowered `kMaxBufferedBytesPerClient` to 1 byte, rebuilt, and
+  connected a `curl`-as-WebSocket-client that never read past the handshake.
+  The very first notification (`test`, id 180) triggered the drop on first
+  send -- server log showed `WebSocketNotifier: dropping a client on
+  channel 'test' that fell behind reading (76 bytes still buffered)`, the
+  `curl` connection closed with the configured reason text visible on the
+  wire, and `GET /channels/test/metrics`/`.../test2/metrics` kept reporting
+  climbing `framesDecoded` throughout -- confirming the drop path actually
+  fires, logs, and does not disturb decoding or the other channel. Restored
+  `kMaxBufferedBytesPerClient` to 64 KiB and rebuilt before any further
+  testing.
+- At the real 64 KiB threshold, two `curl`-as-listener clients (one per
+  channel, both actually reading/discarding each message as it arrived)
+  received four consecutive notifications each (`test`: ids 191-194;
+  `test2`: ids 232-235) with no drops and no
+  `"dropping a client"` log lines -- confirming the backpressure check
+  does not fire for an ordinarily-reading client.
+- Re-verified the full server-restart recovery end-to-end with the fixed
+  binaries: both channels' 20 persisted events restored on startup (D24
+  unaffected), the already-running Qt client's two `ServerStatusModel`
+  instances reconnected their WebSockets automatically (confirmed via
+  `Get-NetTCPConnection` showing two fresh `Established` connections to
+  port 8081), and the on-screen event lists resumed updating -- no
+  regression from either fix.
+- The pending-call claim fix (`requestNotifyTestChanged()`/
+  `requestNotifyTest2Changed()`) was not separately stress-tested by
+  artificially stalling the Qt event loop for an extended period (no
+  practical way to do that safely in this server without adding test-only
+  code) -- its correctness here rests on the race analysis in this entry's
+  "Explicit bound" section above (every processed call re-reads
+  `ChangeEventLog`'s current newest id, so coalescing never loses an
+  event's *data*, only an intermediate event's own dedicated wire message)
+  plus the ordinary multi-event sequences already observed above (D25's
+  original test results, and the four-in-a-row sequences just above)
+  showing strictly-increasing, non-duplicated ids with no gaps.
+
+**Trade-offs.** A true slow-reader stress test exercising the *real* 64 KiB
+threshold (filling a `QWebSocket`'s send buffer by actually never draining a
+client's TCP receive window, rather than the temporarily-lowered-threshold
+substitute used above) was not performed -- at this message size (tens of
+bytes) and rate (at most roughly one per `ChangeDetector::kEventCooldown`,
+3s, per channel), the volume needed to pressure a socket send buffer up to
+64 KiB through entirely organic traffic is many orders of magnitude beyond
+what this feature can ever produce on its own, so this was judged not worth
+engineering a dedicated reproduction for; an idle/non-reading client was
+verified not to block other work instead, which exercises the same
+code path (broadcast iterating `sendTextMessage()` over every connected
+client) without needing to manufacture actual backpressure. The
+`testNotifyPending_`/`test2NotifyPending_` claim is a hard, code-enforced
+cap (at most one outstanding queued call per channel, not a statistical
+likelihood) so there is nothing left to measure about *how many* can
+accumulate -- the open question this entry's own review left unresolved is
+only the race-analysis argument for "coalescing never loses an event's
+*data*, only an intermediate event's own dedicated wire message" (see the
+"Explicit bound" section above), which was reasoned through rather than
+exercised under an artificially stalled Qt event loop (see Test results
+above for why that specific scenario wasn't reproduced).
+The graceful-shutdown path for `WebSocketNotifier::shutdown()` specifically
+carries the exact same sandbox-verification gap D24 already documented and
+the user already closed by testing it directly (see the addendum above);
+not re-verified a second time for this entry specifically.

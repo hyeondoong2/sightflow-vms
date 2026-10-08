@@ -19,9 +19,25 @@
 #include "EventStore.h"
 #include "HttpServer.h"
 #include "MediaMtxClient.h"
+#include "WebSocketNotifier.h"
 
 namespace {
 constexpr quint16 kListenPort = 8080;
+
+// WebSocket push-notification port (D25) -- deliberately separate from
+// kListenPort: QWebSocketServer owns its own listen socket and does its own
+// HTTP Upgrade handshake internally, which cannot share a port with the
+// hand-rolled, GET-only HttpServer/ClientConnection pair above (D14) without
+// teaching that minimal parser to recognize and hand off an Upgrade
+// request -- deliberately not done, to keep ClientConnection's "exactly one
+// minimal HTTP request per connection" model unchanged. Both are plain,
+// unauthenticated, 127.0.0.1-only sockets, same trust boundary as the
+// existing REST API (no auth key/token exists anywhere in this project to
+// keep out of source control -- D25 adds none). A client reaches channel
+// "test"'s notifications at ws://127.0.0.1:8081/channels/test (and "test2"
+// the same way) -- see WebSocketNotifier.h for the path-routing rule.
+constexpr quint16 kWebSocketPort = 8081;
+
 const char* kMediaMtxApiBaseUrl = "http://127.0.0.1:9997";
 
 // How many of a channel's most recent "화면 변화 감지" events stay in
@@ -97,6 +113,21 @@ int main(int argc, char* argv[])
     DecodeMetrics decodeMetricsTest2;
     ChangeEventLog changeEventLogTest2(kChangeEventLogCapacity);
 
+    // One WebSocket push-notification listener for both channels (D25) --
+    // declared before either DecodeWorker below so it is destroyed *after*
+    // them (C++ reverse-declaration-order destruction): both workers hold a
+    // reference to it and may still have a queued notify call in flight
+    // right up until stop() joins their threads during shutdown. A failed
+    // listen() is logged, not fatal -- sightflow-server keeps serving
+    // HTTP/RTSP exactly as before; connected clients simply fall back to
+    // their existing periodic REST polling with no push notifications this
+    // run (same resilience shape as D24's persistence).
+    WebSocketNotifier wsNotifier(changeEventLogTest, changeEventLogTest2);
+    if (!wsNotifier.listen(kWebSocketPort)) {
+        std::cerr << "sightflow-server: WebSocket notifications unavailable (failed to listen on port "
+                   << kWebSocketPort << ") -- clients will still work via periodic REST polling\n";
+    }
+
     // Startup load (D24): one transient connection on the main thread,
     // opened, used for both channels, and destroyed here -- strictly before
     // either DecodeWorker thread (each opening its own connection to the
@@ -121,13 +152,13 @@ int main(int argc, char* argv[])
     }
 
     DecodeWorker decodeWorkerTest("rtsp://127.0.0.1:8554/test", "test", decodeMetricsTest, changeEventLogTest,
-        dbFilePath, kChangeEventLogCapacity);
+        dbFilePath, kChangeEventLogCapacity, wsNotifier);
     decodeWorkerTest.start();
     DecodeMetricsService decodeMetricsServiceTest(QStringLiteral("test"), decodeMetricsTest);
     ChangeEventService changeEventServiceTest(QStringLiteral("test"), changeEventLogTest);
 
     DecodeWorker decodeWorkerTest2("rtsp://127.0.0.1:8554/test2", "test2", decodeMetricsTest2, changeEventLogTest2,
-        dbFilePath, kChangeEventLogCapacity);
+        dbFilePath, kChangeEventLogCapacity, wsNotifier);
     decodeWorkerTest2.start();
     DecodeMetricsService decodeMetricsServiceTest2(QStringLiteral("test2"), decodeMetricsTest2);
     ChangeEventService changeEventServiceTest2(QStringLiteral("test2"), changeEventLogTest2);
@@ -171,7 +202,8 @@ int main(int argc, char* argv[])
         return -1;
     }
     std::cout << "sightflow-server: listening on http://127.0.0.1:" << kListenPort
-               << " (MediaMTX API at " << kMediaMtxApiBaseUrl << ")" << std::endl;
+               << " (MediaMTX API at " << kMediaMtxApiBaseUrl << "), WebSocket notifications on ws://127.0.0.1:"
+               << kWebSocketPort << std::endl;
 
     // Shutdown: stop accepting + destroy every open connection first (so
     // their response callbacks' QPointer guards go null), then abort any
@@ -188,8 +220,9 @@ int main(int argc, char* argv[])
     // poll or an immediate condition_variable wake) and two fixed channels
     // don't warrant added complexity to overlap them.
     QObject::connect(&app, &QCoreApplication::aboutToQuit,
-        [&httpServer, &mediaMtxClient, &decodeWorkerTest, &decodeWorkerTest2]() {
+        [&httpServer, &wsNotifier, &mediaMtxClient, &decodeWorkerTest, &decodeWorkerTest2]() {
             httpServer.shutdown();
+            wsNotifier.shutdown();
             mediaMtxClient.abortAll();
             decodeWorkerTest.stop();
             decodeWorkerTest2.stop();

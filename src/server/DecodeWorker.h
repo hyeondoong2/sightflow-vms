@@ -12,6 +12,8 @@
 #include "ChangeEventLog.h"
 #include "DecodeMetrics.h"
 
+class WebSocketNotifier;
+
 // Owns a dedicated decode worker thread: RTSP connect -> read -> decode,
 // recording frame count/last-frame size/run state into a caller-owned
 // DecodeMetrics (docs/DECISIONS.md D16), and screen-change events into a
@@ -40,16 +42,29 @@
 // fails), this worker logs it and continues decoding/detecting/serving
 // exactly as before D24 existed -- persistence failing never stops RTSP
 // decoding or change detection (D24's resilience policy).
+//
+// Also notifies `wsNotifier` right after recording each event (D25) -- but
+// never touches a socket itself: this thread only ever calls
+// wsNotifier.requestNotifyTestChanged()/requestNotifyTest2Changed(), which
+// is safe to call directly from here (it touches only a plain
+// std::atomic<bool>, not Qt's meta-object system or a socket) and
+// internally posts a zero-payload QMetaObject::invokeMethod(...,
+// Qt::QueuedConnection) call -- the Qt-sanctioned way to safely reach a
+// QObject living on a different thread -- but only when one is not already
+// outstanding for that channel, which is what actually bounds how many such
+// calls can pile up in Qt's own event queue while its thread is busy. See
+// WebSocketNotifier.h for the full design and its two separate, explicit
+// bounds on pending notifications.
 class DecodeWorker {
 public:
-    // `metrics` and `changeEventLog` must both outlive this DecodeWorker.
-    // `channelName` identifies this channel's own rows in the shared SQLite
-    // database at `dbFilePath` (D24) -- distinct from `url`, which is the
-    // RTSP source, not a storage key. `eventCapacity` must match the
-    // capacity `changeEventLog` was constructed with, so the on-disk and
-    // in-memory bounds for this channel always agree.
+    // `metrics`, `changeEventLog`, and `wsNotifier` must all outlive this
+    // DecodeWorker. `channelName` identifies this channel's own rows in the
+    // shared SQLite database at `dbFilePath` (D24) -- distinct from `url`,
+    // which is the RTSP source, not a storage key. `eventCapacity` must
+    // match the capacity `changeEventLog` was constructed with, so the
+    // on-disk and in-memory bounds for this channel always agree.
     DecodeWorker(std::string url, std::string channelName, DecodeMetrics& metrics, ChangeEventLog& changeEventLog,
-        QString dbFilePath, std::size_t eventCapacity);
+        QString dbFilePath, std::size_t eventCapacity, WebSocketNotifier& wsNotifier);
 
     // Requests stop (if running) and joins the worker thread.
     ~DecodeWorker();
@@ -92,6 +107,7 @@ private:
     ChangeEventLog& changeEventLog_;
     QString dbFilePath_;
     std::size_t eventCapacity_;
+    WebSocketNotifier& wsNotifier_;
     std::atomic<bool> stopRequested_{false};
     std::thread thread_;
 
