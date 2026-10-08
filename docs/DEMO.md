@@ -31,6 +31,52 @@ curl.exe http://127.0.0.1:9997/v3/paths/list
 ```
 `test`, `test2` 두 경로가 `"ready": true`로 보이면 정상입니다.
 
+**기본: 합성 영상(`testsrc`).** 위처럼 인수 없이 실행하면 가벼운 합성
+패턴이 두 채널 모두에 송출됩니다 — 별도 영상 파일이 필요 없습니다.
+
+**선택: 미리 녹화된 MP4 파일을 RTSP 테스트 스트림으로 송출.** 합성 패턴
+대신 **미리 녹화해 둔 영상 파일을 RTSP로 반복 송출**하고 싶다면(실제 장면이
+있는 영상으로 시연하고 싶을 때), 채널별로 파일 경로만 넘기면 됩니다:
+
+```powershell
+.\scripts\Start-TestStreams.ps1 -TestFile .\videos\hallway.mp4 -Test2File .\videos\street.mp4
+```
+
+한 채널만 바꾸려면 `-Channel`과 해당 파일 인수만 넘깁니다 — 다른 채널,
+`sightflow-server.exe`, `sightflow-vms.exe`는 전혀 건드리지 않습니다:
+
+```powershell
+.\scripts\Stop-TestStreams.ps1 -Channel test2
+.\scripts\Start-TestStreams.ps1 -Channel test2 -Test2File .\videos\street.mp4
+```
+
+내부적으로 640px 너비·10fps·H.264(오디오 없음)로 재인코딩하고, 키프레임
+간격을 `-g 20`(10fps 기준 2초)으로 짧게 둡니다. 입력 파일이 없거나 FFmpeg
+실행에 실패하면 오류 메시지에 어떤 채널(`test`/`test2`)인지 명시됩니다.
+
+**`-g`가 왜 필요한지(실측).** 키프레임 간격을 지정하지 않으면 libx264
+기본값(약 250프레임 — 10fps 기준 25초)이 적용되어, 서버/클라이언트가
+RTSP로 (재)접속한 뒤에도 다음 키프레임이 올 때까지 어떤 프레임도 디코딩하지
+못합니다 — FFmpeg 콘솔의 `frame=` 수치가 올라가는 것과 실제로 디코딩 가능한
+프레임이 도착하는 것은 다른 일입니다. `street.mp4`(4K/24fps 원본)로
+`test2`를 3회씩 재시작해 **서버의 `GET /channels/test2/metrics`에서
+`framesDecoded`가 0에서 1 이상으로 바뀌는 시점**을 측정한 결과입니다 — 이는
+서버 쪽 첫 디코딩 프레임 기준이며, `sightflow-vms.exe` 화면에 실제로
+그려지는 시각은 별도로 측정하지 않았습니다:
+
+| 조건 | 1회 | 2회 | 3회 | 중앙값 |
+|---|---|---|---|---|
+| `-g` 미지정 | 26.79s | 26.74s | 26.40s | **26.74s** |
+| `-g 20` | 8.48s | 8.15s | 6.58s | **8.15s** |
+
+`-g 20`만으로 중앙값 기준 약 3.3배 단축되어, `Start-TestStreams.ps1`은
+파일 송출 시 항상 `-g 20`을 적용합니다. (재접속 자체가 지연되는 별도
+원인도 있습니다: 서버/클라이언트 모두 연결 실패 후 고정 5초 간격으로만
+재시도하므로(`docs/ARCHITECTURE.md` §6, `docs/DECISIONS.md` D17/D19),
+송출을 다시 켠 시점이 그 5초 대기 중 어디에 걸리느냐에 따라 최대 5초가
+추가로 걸릴 수 있습니다 — 이미 의도적으로 설계·문서화된 부분이라 바꾸지
+않았습니다.)
+
 ## 1. 서버 실행
 
 새 PowerShell 창에서:

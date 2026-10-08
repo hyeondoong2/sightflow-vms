@@ -34,6 +34,10 @@
 /ffmpeg/
 /mediamtx/
 
+# Demo source video files (large, freely-licensed sample footage) -- not
+# part of the repository; place your own copies here (see docs/DEMO.md).
+/videos/
+
 # Demo scripts' own runtime state/logs (scripts/Start-TestStreams.ps1 /
 # Stop-TestStreams.ps1) -- per-machine, not part of the repository.
 /scripts/logs/
