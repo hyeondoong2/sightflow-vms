@@ -38,3 +38,6 @@
 # Stop-TestStreams.ps1) -- per-machine, not part of the repository.
 /scripts/logs/
 /scripts/.demo-state.json
+
+# Visual Studio per-machine cache/state -- not part of the repository.
+/.vs/
