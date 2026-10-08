@@ -1176,3 +1176,215 @@ of adjustment this project's "optimize/tune only after measurement" rule
 here. `changeRatio` in the API is the *triggering comparison's* ratio at
 the moment the event fired (after the sliding window already cleared
 `kDetectionsRequiredInWindow`) — not an average or a confidence score.
+
+---
+
+## D23 — Each "화면 변화 감지" event gets a per-channel id and an optional JPEG snapshot of the actual decoded frame at that moment; a new `GET /channels/<name>/events/<id>/snapshot` route; client-side selection UI
+
+**Decision:** Each `DecodeWorker` now encodes a small JPEG snapshot of the
+*actual decoded frame* at the exact moment `ChangeDetector` confirms an
+event (D22) — not on every decoded frame, and not a thumbnail reused from
+the change-detection comparison (that thumbnail is a tiny 32x24 grayscale
+sample, D22, not meant to be viewed as a picture). `ChangeEventLog` (D22) is
+extended rather than replaced:
+
+- Every recorded `ChangeEvent` now carries a `std::uint64_t id`, assigned by
+  a per-`ChangeEventLog` monotonically increasing counter (starts at 1,
+  never reused, never meaningful compared across channels — each channel's
+  `ChangeEventLog` is already its own independent instance, D21/D22).
+- Every recorded event is now paired, in the same bounded `std::deque`
+  entry (`Entry{ChangeEvent, std::vector<uint8_t> snapshotJpeg}`), with the
+  JPEG bytes captured for it, if encoding succeeded. Metadata and its
+  snapshot are therefore always evicted together when the log drops its
+  oldest entry at capacity (still 20/channel, unchanged) — a snapshot can
+  never outlive, or be looked up for, an event no longer in the recent
+  window.
+- `recentEvents()` (used by `GET /channels/<name>/events`, read by
+  `ServerStatusModel`/QML on every poll) still returns metadata only —
+  never image bytes — so that endpoint's cost is unchanged from D22. A new
+  `snapshotFor(id, outJpeg)` copies out one event's JPEG under the same
+  mutex, only when asked for by the new per-event route below; the mutex is
+  held only for the deque scan + one small memcpy, never across FFmpeg or
+  socket I/O, matching every other worker/HTTP-thread object in this
+  codebase (`FrameQueue`, `DecodeMetrics`, `CaptureState`).
+
+**Encoding format: FFmpeg's own "mjpeg" encoder, not Qt, not PNG.** Checked
+before choosing: `sightflow-server.exe` links Qt `Core`+`Network` only, no
+`Gui` (D14) — using `QImage::save()` would mean linking `QtGui` into a
+process deliberately kept free of it. FFmpeg's `avcodec`/`swscale` are
+*already* linked into `sightflow-server` for decoding (D16) and need no new
+vcpkg feature for MJPEG specifically: the "mjpeg" encoder is implemented
+natively inside `libavcodec` itself (no `libjpeg`, no external codec
+library). FFmpeg's own "png" encoder was considered and rejected: it needs
+`zlib` for its DEFLATE step, a vcpkg `ffmpeg` feature this project's
+manifest (`vcpkg.json`, `"default-features": false`) does not enable, so its
+availability at this pinned baseline could not be confirmed without
+changing the manifest — MJPEG has no such optional dependency and is
+guaranteed present wherever `avcodec_find_decoder`/`avcodec_find_encoder`
+already work for the existing H.264 RTSP decode path. `SnapshotEncoder.
+{h,cpp}` (new) builds one fresh `SwsContext` (scales to at most 320px on
+the longer side, rounded to even dimensions, preserving aspect ratio —
+`AV_PIX_FMT_YUVJ420P`) and one fresh `AVCodecContext` (qscale-based quality,
+`FF_QP2LAMBDA * 8`) per call, rather than keeping either as persistent
+state: this runs at most once per `ChangeDetector::kEventCooldown` (a few
+seconds), so there is no reuse benefit worth the extra lifetime to manage.
+A hard `kMaxEncodedBytes` (256 KiB) cap rejects (treats as encode failure)
+anything larger than expected at this output size — a defensive ceiling,
+not a value ever expected to actually bind.
+
+**The client decodes the same way, not via Qt's JPEG plugin.**
+`sightflow-vms.exe` already links the same FFmpeg libraries for its own
+live RTSP decode (`Decoder.cpp`, `FrameConverter.cpp`). Rather than asking
+Qt's `QImage` to decode JPEG bytes (which depends on the `imageformats/
+qjpeg.dll` plugin actually being present next to the built executable —
+unconfirmed/unverified for this project's Qt kit, and a plugin, unlike a
+statically-resolved library call, `windeployqt` might or might not deploy
+depending on its own heuristics), `SnapshotDecoder.{h,cpp}` (new,
+client-only) decodes the downloaded bytes with FFmpeg's "mjpeg" *decoder*
+(same zero-new-dependency reasoning as the server's encoder) and feeds the
+result through the **existing** `FrameConverter` — the exact same `AVFrame`
+→ `sws_scale` → `BGRA32` `VideoFrame` step the live video path already uses
+(D12), so the final `QImage` construction is bit-for-bit the same pattern
+`VideoDisplayItem` already relies on (D10). This was chosen specifically to
+avoid introducing a second, unverified image-decoding path's worth of
+deployment risk for what is otherwise the exact same problem the live path
+already solves.
+
+**New HTTP route and its error contract.** `ChangeEventService` (D22) now
+also serves `GET /channels/<name>/events/<id>/snapshot`, matched by a plain
+string prefix/suffix parse (mirrors the existing `parseChannelName` style
+exactly) — `<id>` is parsed as an unsigned integer and used *only* as a
+`ChangeEventLog::snapshotFor()` lookup key, never as a filesystem path or
+file name (snapshots are held in memory only; nothing is ever written to or
+read from disk by this feature at all, so there is no path-traversal
+surface to begin with). Responses:
+- `200 image/jpeg` + raw JPEG bytes, on a hit.
+- `404 application/json {"error":"snapshot_not_available"}` — the event
+  exists (within the current window) but was recorded with no snapshot
+  (the encoder failed for that one frame).
+- `404 application/json {"error":"event_not_found"}` — the id does not
+  exist in the current window, for either of two reasons this log cannot
+  (and, by its own bounded-capacity design, should not try to) distinguish:
+  it never existed, or it existed but has already been evicted past the
+  20-event-per-channel retention window. Both are a correct 404; telling
+  them apart would require retaining unbounded history, which the project's
+  no-unbounded-growth rule rules out — a deliberate, documented trade-off,
+  not an oversight.
+- A non-numeric `<id>` segment simply fails the route's own parse and falls
+  through to the same generic `404 text/plain "Not Found"` every other
+  malformed path in this codebase already gets (`parseChannelName`
+  returning empty behaves identically) — not specially distinguished as
+  `400`, to keep this consistent with the rest of the HTTP surface rather
+  than adding a one-off status code for one route.
+`GET /channels/<name>/events`'s existing fields (`timestamp`, `changeRatio`)
+are unchanged; each event object gains `id` (int), `snapshotAvailable`
+(bool), and, only when true, `snapshotUrl` (the exact path above, server-
+built from the channel name and id — never from caller-supplied input) so a
+client never has to hand-construct the route's shape itself.
+
+**Routing (`src/server/main.cpp`).** The two fixed channels' `/events`
+routes (D21/D22's literal-duplication style, unchanged in spirit) are
+widened from an exact-string match to `path == ".../events" ||
+path.startsWith(".../events/")`, since the snapshot sub-route has a
+variable `<id>` segment main.cpp cannot exact-match the way it does for
+`/metrics`. The catch-all 404 guard that keeps an unmatched `/metrics` or
+`/events` request for any *other* channel name from accidentally falling
+through to `ChannelStatusService` (D14's MediaMTX query, which would
+otherwise treat "test3/metrics" or similar as a literal channel name) is
+widened to also catch `path.contains("/events/")`, covering an unmatched
+snapshot-shaped path for a channel that isn't "test"/"test2" either. Still
+no generic channel registry or dispatcher — two literal channel-name
+checks, same as every prior entry in this family (D20/D21/D22).
+
+**Client UI (`src/qml/Main.qml`).** Each pane's existing recent-events list
+(D22) is now clickable: a `Text` delegate with a `MouseArea` over it,
+enabled only when `modelData.snapshotAvailable` is true (an event with no
+snapshot cannot be selected — there is nothing to show). Clicking toggles a
+per-pane `selectedEventIdTest`/`selectedEventIdTest2` property (-1 = none).
+A new `SnapshotDisplayItem` (QML_ELEMENT, `src/SnapshotDisplayItem.
+{h,cpp}`, mirrors `VideoDisplayItem`'s/`ServerStatusModel`'s self-contained,
+no-`main.cpp`-wiring shape) is shown in a full-pane semi-transparent overlay
+*on top of* that pane's live video — the pane's own size, the live video's
+own `KeepAspectRatio` logic, and the fixed 2-pane 50/50 window layout (D20)
+are completely untouched by this; the overlay is purely an added top layer,
+with its own close "✕" text/`MouseArea`. `SnapshotDisplayItem.snapshotUrl`
+is bound to the selected id (built into the exact route above) when
+selected, and to the empty string when not — setting it empty synchronously
+clears any previously-shown `QImage`, so there is no path by which an old
+pane's last-fetched snapshot can be left looking current after deselection.
+A `Connections` block watching each pane's own `ServerStatusModel.
+statusChanged` clears the selection outright the moment either (a) that
+channel's change-event query becomes unreachable (server/MediaMTX down), or
+(b) the selected id is no longer present in `recentChangeEvents` (evicted
+past the client's own displayed top-5, D18's `kMaxDisplayedEvents`, or past
+the server's 20-event retention) — satisfying the requirement that neither
+a dropped event nor a lost server connection ever leaves a stale snapshot
+displayed as if it were current. `SnapshotDisplayItem` itself additionally
+guards against a slower, now-superseded reply: if the user selects a
+*different* event (or deselects) while a fetch for the previous selection is
+still in flight, the stale reply is detected (its originally-requested URL
+no longer matches the item's current `snapshotUrl`) and discarded on
+arrival — the same "never apply stale data" principle D19 already
+established for the live video path, applied here to one-shot image
+fetches instead of a polled queue.
+
+**Reason:** Requested directly by the user as the next incremental step
+after D22, with explicit constraints: capture the real decoded frame, not a
+synthetic/generated image; encode only at event time, never per frame;
+bound both the image size and the per-channel retention so memory stays
+capped; give each event an id and extend (not replace) the existing
+`/events` contract; keep image transcoding off the Qt/HTTP event-loop
+thread entirely (D16's "never call a blocking/CPU-heavy operation from the
+thread answering HTTP requests" already in force — the JPEG encode happens
+on `DecodeWorker`'s own thread, same as the decode and `ChangeDetector`
+work it sits right next to); keep lock scopes small so one channel's
+event/image query can never stall another channel's decoding or another
+HTTP request; never use a URL string as a filesystem path; and keep
+channel/event isolation absolute (test/test2 never share state, confirmed
+by construction — each `ChangeEventLog` instance, and therefore its
+`nextId_` counter and its snapshots, already belongs to exactly one
+channel, D21/D22 unchanged).
+
+**Alternatives considered:** Reusing `ChangeDetector`'s existing 32x24
+grayscale comparison thumbnail as the "snapshot" — rejected outright: it is
+intentionally tiny and grayscale for cheap comparison math, not meant to be
+a human-viewable picture, and showing it as if it were "the scene at
+detection time" would misrepresent what was actually captured. Writing
+snapshots to disk (a file per event, named by channel/id) — rejected: adds
+a filesystem lifetime/cleanup problem (when to delete a file for an evicted
+event) that an in-memory, capacity-bounded, evicted-together-with-its-event
+design avoids entirely, and the user's own constraint ("URL 문자열을 파일
+경로로 사용하지 않는다") pushed toward never deriving a path from request
+input in the first place — not storing to a path at all removes that risk
+rather than just sanitizing it. `QImage::save(..., "PNG")` on the server —
+rejected per the dependency reasoning above (would require linking `QtGui`
+into a process D14 deliberately kept free of it). A generic
+`/snapshot?id=<id>` query-string route instead of a path segment — rejected
+as inconsistent with every other route in this codebase, all of which
+encode their parameters as path segments, not query strings. Keeping a
+strict distinction between "event never existed" and "event evicted" by
+retaining evicted ids indefinitely — rejected as unbounded growth, exactly
+what the project's rules forbid; documented as a deliberate, acceptable
+ambiguity instead (see the error-contract paragraph above).
+
+**Trade-offs:** `GET /channels/<name>/events` now returns slightly more
+per-event JSON (`id`, `snapshotAvailable`, sometimes `snapshotUrl`) —
+negligible at 20 events/channel. One extra JPEG encode (bounded to at most
+once per `ChangeDetector::kEventCooldown`, a few seconds) runs on
+`DecodeWorker`'s own thread when an event fires — not measured against real
+camera footage for how long a 320px MJPEG encode actually takes, but this
+is the same thread and the same "runs between decode iterations, not
+per-decoded-frame" budget `ChangeDetector`'s own comparison already uses,
+so no new concurrency hazard is introduced, only a slightly larger slice of
+that existing budget on the (rare) frame an event fires on. Worst-case
+added memory is bounded but not misleadingly small: `kMaxEncodedBytes`
+(256 KiB) × 20 events × 2 channels = 10 MiB *ceiling*; actual snapshots at
+320px/qscale 8 are expected to run far smaller in practice (tens of KiB),
+but this was not measured against real camera footage either — consistent
+with this project's repeated "measure later if it matters" stance (D5)
+rather than a claim that the realistic figure is already known. The "event
+never existed" vs. "event evicted" ambiguity in the 404 contract (see
+above) means a client cannot distinguish a typo'd id from a legitimately
+expired one from the HTTP response alone — accepted, documented, not
+expected to matter for a UI that only ever requests ids it just read from
+`recentEvents()`/`recentChangeEvents`.

@@ -164,6 +164,11 @@ void ServerStatusModel::queryChangeEvents()
                 entry[QStringLiteral("time")] =
                     eventTime.isValid() ? eventTime.toLocalTime().toString(QStringLiteral("hh:mm:ss")) : QString();
                 entry[QStringLiteral("ratio")] = eventObj.value(QStringLiteral("changeRatio")).toDouble();
+                // Added by D23 -- lets QML offer a per-event snapshot without
+                // guessing an id or re-deriving the server's URL shape itself.
+                entry[QStringLiteral("id")] = eventObj.value(QStringLiteral("id")).toVariant();
+                entry[QStringLiteral("snapshotAvailable")] =
+                    eventObj.value(QStringLiteral("snapshotAvailable")).toBool(false);
                 recentChangeEvents_.append(entry);
             }
         }

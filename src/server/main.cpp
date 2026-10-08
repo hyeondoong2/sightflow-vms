@@ -73,11 +73,18 @@ int main(int argc, char* argv[])
             decodeMetricsServiceTest.handleRequest(method, path, std::move(respond));
         } else if (path == QStringLiteral("/channels/test2/metrics")) {
             decodeMetricsServiceTest2.handleRequest(method, path, std::move(respond));
-        } else if (path == QStringLiteral("/channels/test/events")) {
+        } else if (path == QStringLiteral("/channels/test/events")
+                   || path.startsWith(QStringLiteral("/channels/test/events/"))) {
+            // Covers both the plain event list and the per-event
+            // "/events/<id>/snapshot" sub-route (D23) -- ChangeEventService
+            // itself distinguishes the two; any other sub-path under
+            // ".../events/" that it doesn't recognize is its own 404.
             changeEventServiceTest.handleRequest(method, path, std::move(respond));
-        } else if (path == QStringLiteral("/channels/test2/events")) {
+        } else if (path == QStringLiteral("/channels/test2/events")
+                   || path.startsWith(QStringLiteral("/channels/test2/events/"))) {
             changeEventServiceTest2.handleRequest(method, path, std::move(respond));
-        } else if (path.endsWith(QStringLiteral("/metrics")) || path.endsWith(QStringLiteral("/events"))) {
+        } else if (path.endsWith(QStringLiteral("/metrics")) || path.endsWith(QStringLiteral("/events"))
+                   || path.contains(QStringLiteral("/events/"))) {
             respond(404, "text/plain", "Not Found");
         } else {
             channelStatusService.handleRequest(method, path, std::move(respond));

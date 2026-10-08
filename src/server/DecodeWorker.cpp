@@ -13,6 +13,7 @@ extern "C" {
 #include "ChangeDetector.h"
 #include "Decoder.h"
 #include "RtspSource.h"
+#include "SnapshotEncoder.h"
 
 DecodeWorker::DecodeWorker(std::string url, DecodeMetrics& metrics, ChangeEventLog& changeEventLog)
     : url_(std::move(url))
@@ -181,9 +182,21 @@ void DecodeWorker::run()
 
                 // Reads frame->data/linesize while the frame is still valid
                 // (before unref below) -- never stores the AVFrame or a
-                // pointer into it; only a ratio, if any, crosses out.
+                // pointer into it; only a ratio, and now a small encoded
+                // JPEG snapshot, if any, crosses out.
                 if (const std::optional<double> changeRatio = changeDetector.processFrame(frame.get())) {
-                    changeEventLog_.record(*changeRatio);
+                    // The snapshot is encoded only now, at the moment an
+                    // event is confirmed -- never once per decoded frame
+                    // (docs/DECISIONS.md D23). A failed encode still records
+                    // the event (the ratio is always known); it is simply
+                    // recorded with no retrievable image, never a
+                    // fabricated/placeholder one.
+                    std::vector<uint8_t> snapshotJpeg;
+                    std::string snapshotError;
+                    if (std::optional<std::vector<uint8_t>> encoded = encodeJpegSnapshot(frame.get(), snapshotError)) {
+                        snapshotJpeg = std::move(*encoded);
+                    }
+                    changeEventLog_.record(*changeRatio, std::move(snapshotJpeg));
                 }
 
                 av_frame_unref(frame.get()); // must be clean before the next receiveFrame call

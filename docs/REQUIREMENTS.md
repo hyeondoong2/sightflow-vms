@@ -54,8 +54,11 @@ Do not design or implement any of the following as part of Phase 1, even partial
   change detection) check — a downscaled-thumbnail pixel comparison, no
   OpenCV, explicitly not motion/object detection — at the user's explicit
   direction ahead of this phase boundary; see D22 in `docs/DECISIONS.md`.
-  Does not widen this exclusion for anything else; no OpenCV dependency, no
-  object/person recognition, was added.
+  D23 extends this with a per-event id and a small JPEG snapshot of the
+  actual decoded frame at the moment each event fires, encoded/decoded via
+  FFmpeg (no OpenCV, no Qt image plugin, no new dependency). Does not widen
+  this exclusion for anything else; no OpenCV dependency, no object/person
+  recognition, was added.
 - SQLite or any persistence of events/metadata.
 - REST or WebSocket APIs. **Exception:** `sightflow-server.exe`
   (`GET /channels/<name>`, a MediaMTX status query) was added at the user's

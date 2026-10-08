@@ -40,6 +40,19 @@ each threshold constant was chosen, and its known false-positive/
 false-negative risk. Like D20/D21, this is a narrow Phase 1 exception, not
 Phase 3 (`docs/ROADMAP.md`) having begun.
 
+**Snapshot exception (D23).** At the exact moment `ChangeDetector` confirms
+an event (not per decoded frame), the same `DecodeWorker` thread also
+encodes a small JPEG of that real decoded frame (`SnapshotEncoder`, FFmpeg's
+own "mjpeg" encoder — no new dependency, D23) and stores it alongside that
+event in `ChangeEventLog`, evicted together with it once the 20-event
+capacity is exceeded. `GET /channels/<name>/events/<id>/snapshot`
+(`ChangeEventService`, same class as above) serves it; the client decodes it
+back via FFmpeg's "mjpeg" decoder plus the existing `FrameConverter`
+(`SnapshotDecoder`, `sightflow-vms.exe`-only) and displays it through a new
+`SnapshotDisplayItem`, selected per channel from `src/qml/Main.qml`'s event
+list. No image bytes, and no transcoding work, ever cross onto the Qt
+HTTP-handling thread or the Qt UI thread — see D23 for the full design.
+
 ## 1. Data flow
 
 ```

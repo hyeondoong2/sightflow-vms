@@ -17,6 +17,7 @@ qt_add_executable(sightflow-vms
     src/FrameConverter.cpp
     src/FrameQueue.cpp
     src/CaptureWorker.cpp
+    src/SnapshotDecoder.cpp
 )
 
 qt_add_qml_module(sightflow-vms
@@ -29,6 +30,8 @@ qt_add_qml_module(sightflow-vms
         src/VideoDisplayItem.cpp
         src/ServerStatusModel.h
         src/ServerStatusModel.cpp
+        src/SnapshotDisplayItem.h
+        src/SnapshotDisplayItem.cpp
 )
 
 target_include_directories(sightflow-vms PRIVATE ${FFMPEG_INCLUDE_DIRS} src)
@@ -63,6 +66,7 @@ qt_add_executable(sightflow-server
     src/server/ChangeDetector.cpp
     src/server/ChangeEventLog.cpp
     src/server/ChangeEventService.cpp
+    src/server/SnapshotEncoder.cpp
     src/RtspSource.cpp
     src/Decoder.cpp
 )
