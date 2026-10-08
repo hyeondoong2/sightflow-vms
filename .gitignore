@@ -33,3 +33,8 @@
 
 /ffmpeg/
 /mediamtx/
+
+# Demo scripts' own runtime state/logs (scripts/Start-TestStreams.ps1 /
+# Stop-TestStreams.ps1) -- per-machine, not part of the repository.
+/scripts/logs/
+/scripts/.demo-state.json
